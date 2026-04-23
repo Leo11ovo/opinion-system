@@ -34,6 +34,7 @@ from .rag import (
     get_rag_build_status,
     ensure_routerrag_db,
     ensure_tagrag_db,
+    import_routerrag_artifacts,
     list_project_routerrag_topics,
     list_project_tagrag_topics,
     start_rag_build,
@@ -168,6 +169,7 @@ __all__ = [
     "get_rag_build_status",
     "list_project_routerrag_topics",
     "list_project_tagrag_topics",
+    "import_routerrag_artifacts",
     "start_rag_build",
     # Content analysis prompt helpers
     "content_prompt_path",

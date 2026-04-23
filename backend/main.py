@@ -603,7 +603,14 @@ def router_retrieve_command(topic, query, mode, topk_graphrag, topk_normalrag, t
               help='Judge 评分方式：with_reference=问题+标准答案+模型答案，no_reference=仅问题+模型答案不依赖文档（默认 with_reference）')
 @click.option('--no-judge', is_flag=True, help='禁用 LLM Judge')
 @click.option('--no-fill-relevant', is_flag=True, help='不自动补充 relevant_doc_ids（需在 JSON 中提供）')
-def eval_rag_command(topic, eval_data_path, mode, relevant_method, judge_mode, no_judge, no_fill_relevant):
+@click.option('--eval-scope', default='all', type=click.Choice(['all', 'retrieval', 'generation', 'ux']),
+              help='评估范围（默认 all）')
+@click.option('--top-k', default=10, type=int, help='检索 Top-k 截断（默认 10）')
+@click.option('--manual-feedback-path', type=click.Path(exists=True, path_type=Path), required=False,
+              help='人工 UX 评分 JSON/JSONL 文件路径')
+@click.option('--no-breakdown', is_flag=True, help='不输出按 question_type 分组统计')
+def eval_rag_command(topic, eval_data_path, mode, relevant_method, judge_mode, no_judge, no_fill_relevant,
+                     eval_scope, top_k, manual_feedback_path, no_breakdown):
     """
     运行 RAG 评估：Precision、Recall、LLM Judge（RouterRAG）
     """
@@ -618,6 +625,10 @@ def eval_rag_command(topic, eval_data_path, mode, relevant_method, judge_mode, n
             judge_mode=judge_mode,
             fill_relevant_docs_with_keywords=not no_fill_relevant,
             relevant_method=relevant_method,
+            eval_scope=eval_scope,
+            top_k=top_k,
+            include_breakdown=not no_breakdown,
+            manual_feedback_path=manual_feedback_path,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return True

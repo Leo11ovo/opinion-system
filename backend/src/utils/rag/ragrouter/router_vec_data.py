@@ -53,7 +53,15 @@ class TokenCounter:
 class TextProcessor:
     """文本处理器 - 清洗、合并、切割、建立映射"""
     
-    def __init__(self, base_path: Path, logger=None):
+    def __init__(
+        self,
+        base_path: Path,
+        logger=None,
+        *,
+        chunk_mode: str = "sentence",
+        chunk_size: int = 220,
+        chunk_overlap: int = 40,
+    ):
         self.base_path = base_path
         self.normal_db = base_path / "normal_db"
         self.text_db = self.normal_db / "text_db"
@@ -62,8 +70,18 @@ class TextProcessor:
         self.entities_db = self.normal_db / "entities_db"
         self.relationships_db = self.normal_db / "relationships_db"
         self.log_db = self.normal_db / "log_db"
-        
-        self.log_db.mkdir(parents=True, exist_ok=True)
+
+        # Ensure all working directories exist before writing any intermediate files.
+        for p in (
+            self.normal_db,
+            self.text_db,
+            self.doc_db,
+            self.sentence_db,
+            self.entities_db,
+            self.relationships_db,
+            self.log_db,
+        ):
+            p.mkdir(parents=True, exist_ok=True)
         
         self.doc_mapping = {}
         self.text_mapping = {}
@@ -73,6 +91,9 @@ class TextProcessor:
         self.new_doc_ids = []  # 本次新增的文档ID
         
         self.logger = logger
+        self.chunk_mode = str(chunk_mode or "sentence").strip().lower()
+        self.chunk_size = max(80, int(chunk_size or 220))
+        self.chunk_overlap = max(0, int(chunk_overlap or 40))
     
     def clean_text(self, text: str) -> str:
         """清洗文本：去除多余空格和换行"""
@@ -125,8 +146,11 @@ class TextProcessor:
             with open(doc_file, 'r', encoding='utf-8') as f:
                 doc_text = f.read()
             
-            sentences = re.split(r'[。！？；]', doc_text)
-            sentences = [s.strip() for s in sentences if s.strip()]
+            if self.chunk_mode == "window":
+                sentences = self._split_by_window(doc_text)
+            else:
+                sentences = re.split(r'[。！？；]', doc_text)
+                sentences = [s.strip() for s in sentences if s.strip()]
             
             if doc_id not in self.doc_mapping:
                 self.doc_mapping[doc_id] = {'sentence_ids': []}
@@ -151,6 +175,23 @@ class TextProcessor:
         
         with open(self.sentence_db / "sentences.json", 'w', encoding='utf-8') as f:
             json.dump(all_sentences, f, ensure_ascii=False, indent=2)
+
+    def _split_by_window(self, doc_text: str) -> List[str]:
+        """按字符窗口切分，适合长文本与情绪化段落。"""
+        text = str(doc_text or "").strip()
+        if not text:
+            return []
+        win = self.chunk_size
+        overlap = min(self.chunk_overlap, max(0, win // 2))
+        step = max(1, win - overlap)
+        chunks: List[str] = []
+        for start in range(0, len(text), step):
+            part = text[start:start + win].strip()
+            if part:
+                chunks.append(part)
+            if start + win >= len(text):
+                break
+        return chunks
             
     def _save_mappings(self) -> None:
         """保存统一的映射到log_db（单个JSON文件，支持增量更新）"""
@@ -690,10 +731,28 @@ class LanceDBManager:
         except Exception as e:
             log_error(self.logger, f"{table_name} 保存失败: {str(e)}", "RouterVectorize")
 
+    def drop_table_if_exists(self, table_name: str) -> None:
+        """删除表（若存在）。"""
+        try:
+            if table_name in self.db.table_names():
+                self.db.drop_table(table_name)
+                log_success(self.logger, f"已删除旧表: {table_name}", "RouterVectorize")
+        except Exception as e:
+            log_error(self.logger, f"删除表失败 {table_name}: {str(e)}", "RouterVectorize")
+
 class VectorizationPipeline:
     """向量化处理流水线 - 完整流程管理"""
     
-    def __init__(self, topic_name: str = "控烟", logger=None, base_path: Optional[Path] = None):
+    def __init__(
+        self,
+        topic_name: str = "控烟",
+        logger=None,
+        base_path: Optional[Path] = None,
+        *,
+        chunk_mode: str = "sentence",
+        chunk_size: int = 220,
+        chunk_overlap: int = 40,
+    ):
         """
         初始化向量化流水线
         
@@ -725,7 +784,13 @@ class VectorizationPipeline:
             prompts_file = get_configs_root() / "prompt" / "router_vec" / "默认.yaml"
         
         # 初始化各组件（各组件负责自己的目录创建）
-        self.text_processor = TextProcessor(base_path, logger)
+        self.text_processor = TextProcessor(
+            base_path,
+            logger,
+            chunk_mode=chunk_mode,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
         self.entity_extractor = EntityRelationExtractor(
             api_key, 
             str(prompts_file),
@@ -735,7 +800,7 @@ class VectorizationPipeline:
         )
         self.embedding_generator = EmbeddingGenerator(
             api_key, 
-            max_concurrent=30,
+            max_concurrent=5,
             model=embedding_config.get('model', 'text-embedding-v4'),
             logger=logger
         )
@@ -821,20 +886,7 @@ class VectorizationPipeline:
             
             # 步骤4: 生成向量并存LanceDB
             # 调用向量化，返回去重后的最大ID
-            final_entity_last_id, final_relation_last_id = await self._generate_and_save()
-            
-            # 更新映射文件（last_id = count = 去重后的最大ID）
-            entity_count = 0
-            relation_count = 0
-            try:
-                if "graphrag_entities" in self.lancedb_manager.db.table_names():
-                    entity_count = self.lancedb_manager.db.open_table("graphrag_entities").count_rows()
-                if "graphrag_relationships" in self.lancedb_manager.db.table_names():
-                    relation_count = self.lancedb_manager.db.open_table("graphrag_relationships").count_rows()
-            except:
-                pass
-            
-            # last_id和count都是去重后的最大ID
+            final_entity_last_id, final_relation_last_id, entity_count, relation_count = await self._generate_and_save()
             self._update_mapping(final_entity_last_id, final_relation_last_id, entity_count, relation_count)
             
         except Exception as e:
@@ -848,7 +900,7 @@ class VectorizationPipeline:
         self.doc_time_mapping[doc_id] = time_str
         log_success(self.logger, f"时间标签提取完成：{time_str}", "RouterVectorize")
     
-    async def _generate_and_save(self) -> Tuple[int, int]:
+    async def _generate_and_save(self) -> Tuple[int, int, int, int]:
         """生成向量并存LanceDB，返回去重后的最大ID"""
         
         # 1. 句子向量（增量：只处理新文档的句子）
@@ -933,21 +985,8 @@ class VectorizationPipeline:
                 else:
                     total_duplicates += 1
                 
-        # 从LanceDB读取已有实体的向量（通过doc_name+entity_name+type匹配，同文档去重）
+        # 目前仅维护 normalrag + graphrag_texts，实体向量不再落表。
         existing_entity_vectors = {}  # key=(doc_name, entity_name, type) -> (name_vec, desc_vec)
-        
-        try:
-            if "graphrag_entities" in self.lancedb_manager.db.table_names():
-                table = self.lancedb_manager.db.open_table("graphrag_entities")
-                df = table.to_pandas()
-                for _, row in df.iterrows():
-                    key = (row['doc_name'], row['entity_name'], row['type'])
-                    existing_entity_vectors[key] = (
-                        row['entity_name_vec'].tolist() if hasattr(row['entity_name_vec'], 'tolist') else list(row['entity_name_vec']),
-                        row['description_vec'].tolist() if hasattr(row['description_vec'], 'tolist') else list(row['description_vec'])
-                    )
-        except:
-            pass
         
         # 判断哪些实体需要向量化
         entities_need_vec = []
@@ -1033,7 +1072,7 @@ class VectorizationPipeline:
             with open(entities_file, 'w', encoding='utf-8') as f:
                 json.dump(entities_for_save, f, ensure_ascii=False, indent=2)
         
-        # 保存到LanceDB
+        # 不再写入实体向量表，仅保留文件侧去重结果供 text 标签聚合。
         if entities_data:
             vec_dim = len(entities_data[0]["description_vec"])
             schema = pa.schema([
@@ -1048,7 +1087,7 @@ class VectorizationPipeline:
                 pa.field("text_ids", pa.string()),
                 pa.field("doc_ids", pa.string())
             ])
-            self.lancedb_manager.save_table("graphrag_entities", entities_data, schema, mode="overwrite")
+            log_success(self.logger, "实体向量表未启用，已跳过写入", "RouterVectorize")
         
         # 3. 读取关系、合并新旧、按文档去重、增量向量化
         
@@ -1107,18 +1146,8 @@ class VectorizationPipeline:
                     total_duplicates += 1
         
         
-        # 从LanceDB读取已有关系的向量（通过doc_name+source+target匹配，同文档去重）
+        # 目前仅维护 normalrag + graphrag_texts，关系向量不再落表。
         existing_relation_vectors = {}  # key=(doc_name, source, target) -> description_vec
-        
-        try:
-            if "graphrag_relationships" in self.lancedb_manager.db.table_names():
-                table = self.lancedb_manager.db.open_table("graphrag_relationships")
-                df = table.to_pandas()
-                for _, row in df.iterrows():
-                    key = (row['doc_name'], row['source'], row['target'])
-                    existing_relation_vectors[key] = row['description_vec'].tolist() if hasattr(row['description_vec'], 'tolist') else list(row['description_vec'])
-        except:
-            pass
         
         # 判断哪些关系需要向量化
         relations_need_vec = []
@@ -1195,7 +1224,7 @@ class VectorizationPipeline:
             with open(relations_file, 'w', encoding='utf-8') as f:
                 json.dump(relations_for_save, f, ensure_ascii=False, indent=2)
         
-        # 保存到LanceDB
+        # 不再写入关系向量表，仅保留文件侧去重结果供 text 标签聚合。
         if relations_data:
             vec_dim = len(relations_data[0]["description_vec"])
             schema = pa.schema([
@@ -1209,7 +1238,7 @@ class VectorizationPipeline:
                 pa.field("text_ids", pa.string()),
                 pa.field("doc_ids", pa.string())
             ])
-            self.lancedb_manager.save_table("graphrag_relationships", relations_data, schema, mode="overwrite")
+            log_success(self.logger, "关系向量表未启用，已跳过写入", "RouterVectorize")
         
         # 4. 文本表（新增text、text_tag、text_tag_vec字段）
         # 收集每个文本的实体ID（使用新ID）
@@ -1285,7 +1314,7 @@ class VectorizationPipeline:
                 self.lancedb_manager.save_table("graphrag_texts", texts_data, schema, mode="auto")
         
         # 返回去重后的最大ID
-        return final_entity_last_id, final_relation_last_id
+        return final_entity_last_id, final_relation_last_id, len(entities_for_save), len(relations_for_save)
     
     def _update_mapping(self, last_entity_id: int, last_relation_id: int, 
                        entity_count: int, relation_count: int) -> None:
@@ -1321,7 +1350,14 @@ class VectorizationPipeline:
             "RouterVectorize"
         )
 
-def run_ragrouter(topic_name: str = "默认", base_path: Optional[Path] = None) -> bool:
+def run_ragrouter(
+    topic_name: str = "默认",
+    base_path: Optional[Path] = None,
+    *,
+    chunk_mode: str = "sentence",
+    chunk_size: int = 220,
+    chunk_overlap: int = 40,
+) -> bool:
     """
     命令行接口，运行RagRouter向量化处理
     
@@ -1339,7 +1375,14 @@ def run_ragrouter(topic_name: str = "默认", base_path: Optional[Path] = None) 
         log_module_start(logger, "RouterVectorize", f"开始向量化 - 主题: {topic_name}")
         
         # 创建流水线
-        pipeline = VectorizationPipeline(topic_name=topic_name, logger=logger, base_path=base_path)
+        pipeline = VectorizationPipeline(
+            topic_name=topic_name,
+            logger=logger,
+            base_path=base_path,
+            chunk_mode=chunk_mode,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
         
         # 运行完整流程
         asyncio.run(pipeline.run(skip_check=False))

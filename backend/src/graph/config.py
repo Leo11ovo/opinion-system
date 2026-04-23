@@ -34,9 +34,13 @@ def get_graph_config() -> Dict[str, Any]:
         "uri": os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
         "user": os.environ.get("NEO4J_USER", "neo4j"),
         "password": os.environ.get("NEO4J_PASSWORD", ""),
+        "database": os.environ.get("NEO4J_DATABASE", ""),
         "sync_batch_size": 1000,
         "enable_entity_extraction": True,
         "enable_chunk_embedding": True,
+        # Keep chunking strategy consistent across chunk writer and extractor.
+        "chunk_size": 512,
+        "chunk_overlap": 50,
     }
     if path.exists() and yaml is not None:
         try:
@@ -44,6 +48,7 @@ def get_graph_config() -> Dict[str, Any]:
                 file_cfg = yaml.safe_load(f) or {}
             
             # Handle nested 'neo4j' key if present
+            # Correctly merge top-level 'neo4j' into cfg
             if "neo4j" in file_cfg and isinstance(file_cfg["neo4j"], dict):
                 cfg.update(file_cfg["neo4j"])
             else:
@@ -52,6 +57,9 @@ def get_graph_config() -> Dict[str, Any]:
             pass
     if not cfg.get("password") and os.environ.get("NEO4J_PASSWORD"):
         cfg["password"] = os.environ.get("NEO4J_PASSWORD")
+    # Allow runtime override without editing yaml.
+    if os.environ.get("NEO4J_DATABASE"):
+        cfg["database"] = os.environ.get("NEO4J_DATABASE")
     return cfg
 
 

@@ -37,22 +37,31 @@ def load_data(json_file: str, logger) -> List[Dict[str, Any]]:
         log_error(logger, f"加载数据文件失败: {e}", "Tagvectorize")
         raise
 
-def get_embeddings(texts: List[str], client: OpenAI, logger, dimension: int, model: str) -> List[List[float]]:
-    """使用指定模型获取文本向量。"""
+def get_embeddings_batched(texts: List[str], client: OpenAI, logger, dimension: int, model: str, batch_size: int = 10) -> List[List[float]]:
+    """Batch process texts to get embeddings."""
     embeddings = []
-    for i, text in enumerate(texts):
+    total = len(texts)
+    
+    for i in range(0, total, batch_size):
+        batch_texts = texts[i : i + batch_size]
+        # Clean texts to avoid issues
+        cleaned_batch = [t.replace("\n", " ") if t else "" for t in batch_texts]
+        
         try:
             response = client.embeddings.create(
                 model=model,
-                input=text
+                input=cleaned_batch
             )
-            embeddings.append(response.data[0].embedding)
-            if (i + 1) % 10 == 0 or i == len(texts) - 1:  # 每10个或最后一个显示进度
-                log_success(logger, f"向量化进度: {i+1}/{len(texts)}", "Tagvectorize")
+            batch_embeddings = [data.embedding for data in response.data]
+            embeddings.extend(batch_embeddings)
+            
+            log_success(logger, f"向量化进度: {min(i + batch_size, total)}/{total}", "Tagvectorize")
+            
         except Exception as e:
-            log_error(logger, f"向量化失败: {e}", "Tagvectorize")
-            # 如果失败，使用零向量
-            embeddings.append([0.0] * dimension)
+            log_error(logger, f"批量向量化失败 (batch {i}-{i+batch_size}): {e}", "Tagvectorize")
+            # Fallback: fill with zero vectors to maintain alignment
+            embeddings.extend([[0.0] * dimension] * len(batch_texts))
+            
     return embeddings
 
 def get_existing_ids(db_path: str, table_name: str, logger) -> set:
@@ -75,16 +84,20 @@ def vectorize_and_store(
     topic_name: str = "控烟",
     format_json_path: str = None,
     vector_db_path: str = None,
+    rebuild: bool = False,
+    batch_size: int = 500
 ):
     """
-    主函数：向量化数据并存储到LanceDB数据库。
+    主函数：向量化数据并存储到LanceDB数据库（批量处理版）。
     
     Args:
-        topic_name: RAG主题名称（如"控烟"），用于指定读取哪个JSON文件和生成对应的表
+        topic_name: RAG主题名称
+        rebuild: 是否重建数据库
+        batch_size: 批处理大小
     """
-    # 初始化logger，使用主题名称作为日志标识
+    # 初始化logger
     logger = setup_logger(f"Tagvectorize_{topic_name}", "default")
-    log_module_start(logger, "Tagvectorize", f"开始向量化数据 - 主题: {topic_name}")
+    log_module_start(logger, "Tagvectorize", f"开始向量化数据 (Batch Mode) - 主题: {topic_name}")
     
     try:
         from ..embedding import get_sync_client
@@ -92,7 +105,6 @@ def vectorize_and_store(
         log_success(logger, f"客户端初始化成功 (Model: {model})", "Tagvectorize")
         
         # 加载数据
-        # 使用绝对路径定位主题JSON文件（允许外部传入）
         if format_json_path:
             format_json_path = Path(format_json_path)
         else:
@@ -105,7 +117,7 @@ def vectorize_and_store(
 
         data = load_data(str(format_json_path), logger)
         
-        # 确保数据目录存在
+        # 准备DB路径
         if vector_db_path:
             vector_db_path = Path(vector_db_path)
         else:
@@ -114,57 +126,93 @@ def vectorize_and_store(
         os.makedirs(vector_db_path, exist_ok=True)
         db_path = str(vector_db_path)
         
-        # 将主题名称转换为拼音作为表名（lance不支持中文表名）
         table_name = to_pinyin(topic_name)
-        log_success(logger, f"使用表名: {table_name} (对应主题: {topic_name})", "Tagvectorize")
+        log_success(logger, f"使用表名: {table_name}", "Tagvectorize")
         
-        # 获取已存在的ID
-        existing_ids = get_existing_ids(db_path, table_name, logger)
-        
-        # 筛选需要处理的新数据
-        new_data = []
-        for i, item in enumerate(data):
-            if i not in existing_ids:
-                new_data.append((i, item))
-        
-        if not new_data:
-            db = lancedb.connect(db_path)
-            return db.open_table(table_name)
-            
-        # 准备向量化数据
-        texts = []
-        for _, item in new_data:
-            texts.append(item['tag'])  # 只对tag进行向量化
-        
-        # 获取标签向量
-        tag_embeddings = get_embeddings(texts, client, logger, dimension, model)
-
-        
-        # 准备存储数据
-        records = []
-        for (i, item), tag_vec in zip(new_data, tag_embeddings):
-            record = {
-                'id': i,
-                'text': item['text'],
-                'tag_vec': tag_vec
-            }
-            records.append(record)
-        
-        # 写入或追加到LanceDB数据库
-        
-        # 连接数据库
         db = lancedb.connect(db_path)
         
-        if existing_ids:
-            # 追加模式
-            table = db.open_table(table_name)
-            table.add(records)
-        else:
-            # 创建新模式
+        # 重建处理
+        if rebuild and table_name in db.table_names():
+            db.drop_table(table_name)
+            log_success(logger, f"已删除旧表: {table_name}", "Tagvectorize")
+
+        # 获取已存在的ID
+        existing_ids = set()
+        if not rebuild:
+             existing_ids = get_existing_ids(db_path, table_name, logger)
+        
+        # 筛选新数据
+        new_items = []
+        for i, item in enumerate(data):
+            item_id = item.get('id', i)
+            if item_id not in existing_ids:
+                new_items.append((item_id, item))
+        
+        if not new_items:
+            log_success(logger, "没有新数据需要处理", "Tagvectorize")
             if table_name in db.table_names():
-                # 如果表已存在但为空，先删除再创建
-                db.drop_table(table_name)
-            table = db.create_table(table_name, records)
+                return db.open_table(table_name)
+            return None
+
+        log_success(logger, f"待处理数据量: {len(new_items)} 条", "Tagvectorize")
+
+        # 批量处理
+        total_processed = 0
+        table = None
+        all_records = []
+        
+        for i in range(0, len(new_items), batch_size):
+            batch_items = new_items[i : i + batch_size]
+            batch_texts = [item['tag'] for _, item in batch_items]
+            
+            # 批量获取向量
+            # DashScope API limit is 10 items per batch
+            batch_embeddings = get_embeddings_batched(
+                batch_texts, client, logger, dimension, model, batch_size=10
+            )
+            
+            # 组装记录
+            for (item_id, item), tag_vec in zip(batch_items, batch_embeddings):
+                # Ensure ID is string to avoid type conflicts
+                record_id = str(item_id)
+                
+                record = {
+                    'id': record_id,
+                    'text': item['text'],
+                    'tag_vec': tag_vec,
+                }
+                
+                # Handle metadata: convert to JSON string to avoid schema conflicts (struct vs null vs different fields)
+                if 'metadata' in item:
+                    meta = item['metadata']
+                    if isinstance(meta, dict):
+                        record['metadata'] = json.dumps(meta, ensure_ascii=False)
+                    else:
+                        record['metadata'] = str(meta)
+                        
+                all_records.append(record)
+            
+            total_processed += len(batch_items)
+            log_success(logger, f"已处理(暂存内存): {total_processed}/{len(new_items)}", "Tagvectorize")
+
+        # 一次性写入数据库
+        if all_records:
+            import pyarrow as pa
+            schema = pa.schema([
+                pa.field("id", pa.string()),
+                pa.field("text", pa.string()),
+                pa.field("tag_vec", pa.list_(pa.float64(), dimension)),
+                pa.field("metadata", pa.string())
+            ])
+            
+            if table_name in db.table_names():
+                table = db.open_table(table_name)
+                table.add(all_records)
+                log_success(logger, f"追加写入完成: {len(all_records)}条", "Tagvectorize")
+            else:
+                table = db.create_table(table_name, all_records, schema=schema)
+                log_success(logger, f"新建表写入完成: {len(all_records)}条", "Tagvectorize")
+
         return table
         
     except Exception as e:

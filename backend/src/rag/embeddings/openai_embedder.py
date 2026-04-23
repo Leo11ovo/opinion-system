@@ -1,76 +1,47 @@
-"""OpenAI embedding model."""
-
-from typing import List, Union, Dict, Any, Optional
 import logging
+from typing import List, Union
 import numpy as np
-
 from .base import BaseEmbedder
+# Use relative import based on project structure
+# backend/src/rag/embeddings/openai_embedder.py -> backend/src/utils/rag/embedding.py
+from ...utils.rag.embedding import get_sync_client, generate_embedding_sync
 
 logger = logging.getLogger(__name__)
 
-
 class OpenAIEmbedder(BaseEmbedder):
-    """OpenAI API-based embedding model."""
-
-    def __init__(self, model_name: str = "text-embedding-ada-002", config: Optional[Dict[str, Any]] = None):
-        super().__init__(config)
-        self.model_name = model_name
-        self.api_key = config.get("api_key") if config else None
-        self.client = None
-
-    def _initialize_client(self):
-        """Initialize OpenAI client."""
+    """Embedder using OpenAI API (or compatible like Qwen)."""
+    
+    def __init__(self, model_name: str = None, dimension: int = None):
+        super().__init__()
         try:
-            import openai
-            self.client = openai.Client(api_key=self.api_key)
-        except ImportError:
-            raise ImportError("OpenAI library not installed. Install with: pip install openai")
-
-    def embed(self, texts: Union[str, List[str]], **kwargs) -> Union[List[float], List[List[float]]]:
-        """Generate embeddings for texts."""
-        if not self.client:
-            self._initialize_client()
-
-        # Handle single text input
-        if isinstance(texts, str):
-            texts = [texts]
-
-        try:
-            response = self.client.embeddings.create(
-                model=self.model_name,
-                input=texts
-            )
-            embeddings = [item.embedding for item in response.data]
-
-            # Return single embedding for single input
-            return embeddings[0] if len(embeddings) == 1 else embeddings
-
+            self.client, self.default_model, self.default_dimension = get_sync_client()
+            self.model_name = model_name or self.default_model
+            self.dimension = dimension or self.default_dimension
+            logger.info(f"Initialized OpenAIEmbedder with model {self.model_name}")
         except Exception as e:
-            logger.error(f"Failed to generate embeddings: {e}")
+            logger.error(f"Failed to initialize OpenAI client: {e}")
             raise
 
-    def embed_batch(self, texts: List[str], batch_size: int = 100, **kwargs) -> List[List[float]]:
-        """Generate embeddings for a batch of texts."""
+    def embed(self, texts: Union[str, List[str]]) -> Union[List[float], List[List[float]]]:
+        """
+        Embed a string or list of strings.
+        Returns a list of floats (for single string) or list of list of floats.
+        """
+        is_single = isinstance(texts, str)
+        if is_single:
+            texts = [texts]
+            
         embeddings = []
-
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            batch_embeddings = self.embed(batch, **kwargs)
-            if isinstance(batch_embeddings[0], list):
-                embeddings.extend(batch_embeddings)
-            else:
-                embeddings.append(batch_embeddings)
-
+        for text in texts:
+            try:
+                emb = generate_embedding_sync(self.client, text, self.model_name)
+                embeddings.append(emb)
+            except Exception as e:
+                logger.error(f"Error embedding text '{text[:50]}...': {e}")
+                # Return zero vector or skip? 
+                # Better to return zero vector to maintain index alignment if batch processing
+                embeddings.append([0.0] * self.dimension)
+            
+        if is_single:
+            return embeddings[0]
         return embeddings
-
-    def get_dimension(self) -> int:
-        """Get embedding dimension."""
-        # Common dimensions for OpenAI models
-        if "ada-002" in self.model_name:
-            return 1536
-        elif "3-small" in self.model_name:
-            return 1536
-        elif "3-large" in self.model_name:
-            return 3072
-        else:
-            return 1536  # Default

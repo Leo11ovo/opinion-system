@@ -3,9 +3,11 @@ RAG 评估工具：关键词相关文档、检索指标、LLM Judge。
 """
 import asyncio
 import json
+import math
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import lancedb
 import yaml
@@ -168,8 +170,15 @@ def extract_retrieved_doc_ids(router_result: Dict[str, Any]) -> Set[str]:
     for t in tr.get("text_blocks", []):
         add(t.get("doc_id"))
 
-    # graphrag entities (core + extended)
+    # graphrag findings
     gr = router_result.get("graphrag") or {}
+    for finding in gr.get("findings", []) or []:
+        for raw in (finding.get("doc_ids") or []):
+            add(raw)
+        for raw in (finding.get("post_ids") or []):
+            add(raw)
+
+    # graphrag entities (legacy structure)
     entities = gr.get("entities") or {}
     for key in ("core", "extended"):
         for e in (entities.get(key) if isinstance(entities, dict) else []) or []:
@@ -202,6 +211,227 @@ def compute_precision_recall(
     precision = len(intersection) / len(retrieved) if retrieved else 0.0
     recall = len(intersection) / len(relevant) if relevant else 0.0
     return round(precision, 4), round(recall, 4)
+
+
+@dataclass
+class RetrievedEvidenceItem:
+    """统一证据表示，便于跨 retriever 评估。"""
+
+    source: str
+    doc_id: str
+    rank: int
+    text: str
+    evidence_id: str
+    meta: Dict[str, Any]
+
+
+def _stringify_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(x).strip() for x in value if str(x).strip())
+    return str(value).strip()
+
+
+def extract_retrieved_evidence_items(router_result: Dict[str, Any]) -> List[RetrievedEvidenceItem]:
+    """
+    从 RouterRAG 返回中提取统一证据项，用于 Top-k/MRR/nDCG/coverage/attribution 评估。
+    """
+    items: List[RetrievedEvidenceItem] = []
+    if not router_result or router_result.get("status") == "error":
+        return items
+
+    rank = 1
+    for source_name, payload_key in (("normalrag", "normalrag"), ("tagrag", "tagrag"), ("graphrag", "graphrag")):
+        payload = router_result.get(payload_key) or {}
+        if source_name == "normalrag":
+            for row in payload.get("sentences", []) or []:
+                doc_id = _normalize_doc_id(row.get("doc_id"))
+                items.append(
+                    RetrievedEvidenceItem(
+                        source=source_name,
+                        doc_id=doc_id,
+                        rank=rank,
+                        text=_stringify_text(row.get("text") or row.get("sentence_text")),
+                        evidence_id=str(row.get("text_id") or row.get("id") or f"{source_name}_{rank}"),
+                        meta=dict(row),
+                    )
+                )
+                rank += 1
+        elif source_name == "tagrag":
+            for row in payload.get("text_blocks", []) or []:
+                doc_id = _normalize_doc_id(row.get("doc_id"))
+                items.append(
+                    RetrievedEvidenceItem(
+                        source=source_name,
+                        doc_id=doc_id,
+                        rank=rank,
+                        text=_stringify_text(row.get("text")),
+                        evidence_id=str(row.get("text_id") or row.get("id") or f"{source_name}_{rank}"),
+                        meta=dict(row),
+                    )
+                )
+                rank += 1
+        else:
+            findings = payload.get("findings", []) or []
+            for row in findings:
+                doc_ids: List[str] = []
+                for raw in row.get("doc_ids", []) or []:
+                    norm = _normalize_doc_id(raw)
+                    if norm:
+                        doc_ids.append(norm)
+                for raw in row.get("post_ids", []) or []:
+                    norm = _normalize_doc_id(raw)
+                    if norm and norm not in doc_ids:
+                        doc_ids.append(norm)
+                doc_id = doc_ids[0] if doc_ids else ""
+                items.append(
+                    RetrievedEvidenceItem(
+                        source=source_name,
+                        doc_id=doc_id,
+                        rank=rank,
+                        text=_stringify_text(row.get("finding_statement") or row.get("statement") or row.get("finding_title")),
+                        evidence_id=str(row.get("finding_id") or row.get("id") or f"{source_name}_{rank}"),
+                        meta=dict(row),
+                    )
+                )
+                rank += 1
+    return items
+
+
+def compute_topk_metrics(
+    items: List[RetrievedEvidenceItem],
+    relevant_doc_ids: Set[str],
+    *,
+    top_k: int = 10,
+) -> Dict[str, float]:
+    """计算 Top-k precision/recall/hit/MRR/nDCG。"""
+    top_items = items[: max(1, int(top_k))]
+    relevant = set(_normalize_doc_id(x) for x in relevant_doc_ids if x is not None) - {""}
+    hits = [1 if item.doc_id and item.doc_id in relevant else 0 for item in top_items]
+
+    precision_at_k = sum(hits) / len(top_items) if top_items else 0.0
+    recall_at_k = sum(hits) / len(relevant) if relevant else 0.0
+    hit_at_k = 1.0 if any(hits) else 0.0
+
+    reciprocal_rank = 0.0
+    for idx, item in enumerate(top_items, start=1):
+        if item.doc_id and item.doc_id in relevant:
+            reciprocal_rank = 1.0 / idx
+            break
+
+    dcg = 0.0
+    for idx, hit in enumerate(hits, start=1):
+        if hit:
+            dcg += 1.0 / math.log2(idx + 1)
+    ideal_hits = [1] * min(len(relevant), len(top_items))
+    idcg = 0.0
+    for idx, hit in enumerate(ideal_hits, start=1):
+        if hit:
+            idcg += 1.0 / math.log2(idx + 1)
+    ndcg = dcg / idcg if idcg > 0 else 0.0
+
+    return {
+        "precision_at_k": round(precision_at_k, 4),
+        "recall_at_k": round(recall_at_k, 4),
+        "hit_at_k": round(hit_at_k, 4),
+        "mrr": round(reciprocal_rank, 4),
+        "ndcg": round(ndcg, 4),
+    }
+
+
+def compute_evidence_coverage(
+    items: List[RetrievedEvidenceItem],
+    *,
+    required_evidence_ids: Optional[Iterable[Any]] = None,
+    must_hit_terms: Optional[Iterable[Any]] = None,
+) -> Dict[str, Any]:
+    """
+    计算关键证据覆盖率。优先 evidence_id，其次 must_hit_terms 文本命中。
+    """
+    required_ids = {
+        str(x).strip() for x in (required_evidence_ids or []) if str(x).strip()
+    }
+    must_terms = [str(x).strip().lower() for x in (must_hit_terms or []) if str(x).strip()]
+    matched_ids = set()
+    matched_terms = set()
+
+    for item in items:
+        if item.evidence_id in required_ids:
+            matched_ids.add(item.evidence_id)
+        haystack = f"{item.text} {_stringify_text(item.meta)}".lower()
+        for term in must_terms:
+            if term and term in haystack:
+                matched_terms.add(term)
+
+    id_den = len(required_ids)
+    term_den = len(must_terms)
+    id_cov = len(matched_ids) / id_den if id_den else None
+    term_cov = len(matched_terms) / term_den if term_den else None
+
+    if id_cov is not None and term_cov is not None:
+        coverage = (id_cov + term_cov) / 2.0
+    elif id_cov is not None:
+        coverage = id_cov
+    elif term_cov is not None:
+        coverage = term_cov
+    else:
+        coverage = 0.0
+
+    return {
+        "coverage": round(coverage, 4),
+        "matched_evidence_ids": sorted(matched_ids),
+        "matched_terms": sorted(matched_terms),
+    }
+
+
+def compute_retriever_attribution(items: List[RetrievedEvidenceItem], relevant_doc_ids: Set[str]) -> Dict[str, Any]:
+    """统计命中证据按 retriever 来源分布。"""
+    relevant = set(_normalize_doc_id(x) for x in relevant_doc_ids if x is not None) - {""}
+    counts = {"graphrag": 0, "normalrag": 0, "tagrag": 0}
+    total_hits = 0
+    for item in items:
+        if item.doc_id and item.doc_id in relevant:
+            counts.setdefault(item.source, 0)
+            counts[item.source] += 1
+            total_hits += 1
+    shares = {
+        f"{key}_share": round((value / total_hits), 4) if total_hits else 0.0
+        for key, value in counts.items()
+    }
+    return {"hit_counts": counts, "total_hits": total_hits, **shares}
+
+
+def compute_finding_stats(router_result: Dict[str, Any]) -> Dict[str, Any]:
+    """统计 GraphRAG finding-centric 指标。"""
+    graphrag = (router_result or {}).get("graphrag") or {}
+    findings = graphrag.get("findings", []) or []
+    topics: Set[str] = set()
+    platforms: Set[str] = set()
+    events: Set[str] = set()
+    evidence_counts: List[int] = []
+    for row in findings:
+        topics.update(str(x).strip() for x in (row.get("topics") or []) if str(x).strip())
+        platforms.update(str(x).strip() for x in (row.get("platforms") or []) if str(x).strip())
+        events.update(str(x).strip() for x in (row.get("events") or []) if str(x).strip())
+        evidence_counts.append(
+            len(row.get("claim_ids") or [])
+            + len(row.get("chunk_ids") or [])
+            + len(row.get("post_ids") or [])
+        )
+    avg_evidence = (sum(evidence_counts) / len(evidence_counts)) if evidence_counts else 0.0
+    return {
+        "finding_count": len(findings),
+        "avg_evidence_per_finding": round(avg_evidence, 4),
+        "topic_count": len(topics),
+        "platform_count": len(platforms),
+        "event_count": len(events),
+        "topics": sorted(topics)[:20],
+        "platforms": sorted(platforms)[:20],
+        "events": sorted(events)[:20],
+    }
 
 
 # ---- 嵌入相似度：无标注下的「相关文档」----
@@ -341,6 +571,17 @@ _JUDGE_SYSTEM = """你是一个客观的评判员。根据「问题」「标准�
 _JUDGE_SYSTEM_NO_REF = """你是一个客观的评判员。仅根据「问题」和「模型答案」判断质量，不依赖任何标准答案或文档。
 从以下维度综合打分：是否切题、是否连贯、是否像事实性回答（非胡编或明显矛盾）。只输出一个 1-5 的整数：5=很好，4=较好，3=一般，2=较差，1=很差。不要输出其他内容。"""
 
+_JUDGE_SYSTEM_MULTI = """你是一个严格的 RAG 答案评估器。请根据提供的输入，对模型答案进行多维度打分。
+返回 JSON，字段固定为：
+{
+  "accuracy_score": 1-5,
+  "faithfulness_score": 1-5,
+  "completeness_score": 1-5,
+  "citation_score": 1-5,
+  "notes": "简短中文说明"
+}
+不要输出 JSON 以外的内容。"""
+
 
 def build_judge_prompt(question: str, answer_gold: str, answer_pred: str) -> str:
     """构建 LLM Judge 的 user prompt（有参考）。"""
@@ -358,6 +599,22 @@ def build_judge_prompt_no_reference(question: str, answer_pred: str) -> str:
         "【问题】\n" + (question or "") + "\n\n"
         "【模型答案】\n" + (answer_pred or "") + "\n\n"
         "请从切题、连贯、事实性三个维度综合打分，只输出一个 1-5 的整数（5 最好，1 最差）："
+    )
+
+
+def build_multi_judge_prompt(
+    question: str,
+    answer_gold: str,
+    answer_pred: str,
+    evidence_context: str = "",
+) -> str:
+    """构建多维度 Judge 提示词。"""
+    return (
+        "【问题】\n" + (question or "") + "\n\n"
+        "【标准答案】\n" + (answer_gold or "") + "\n\n"
+        "【模型答案】\n" + (answer_pred or "") + "\n\n"
+        "【可用证据】\n" + (evidence_context or "无") + "\n\n"
+        "请从 accuracy、faithfulness、completeness、citation 四个维度分别给出 1-5 分。"
     )
 
 
@@ -395,6 +652,42 @@ def parse_judge_result_no_reference(raw: str) -> float:
     if m_float:
         return min(1.0, max(0.0, float(m_float.group(0))))
     return 0.0
+
+
+def parse_multi_judge_result(raw: str) -> Dict[str, Any]:
+    """解析多维度 judge 输出并归一化到 0-1。"""
+    default = {
+        "accuracy_score": 0.0,
+        "faithfulness_score": 0.0,
+        "completeness_score": 0.0,
+        "citation_score": 0.0,
+        "notes": "",
+    }
+    if not raw:
+        return default
+    text = raw.strip()
+    try:
+        obj = json.loads(text)
+    except Exception:
+        match = re.search(r"\{.*\}", text, re.S)
+        if not match:
+            return default
+        try:
+            obj = json.loads(match.group(0))
+        except Exception:
+            return default
+    out = dict(default)
+    for key in ("accuracy_score", "faithfulness_score", "completeness_score", "citation_score"):
+        try:
+            val = float(obj.get(key, 0))
+        except Exception:
+            val = 0.0
+        if val > 1.0:
+            val = max(1.0, min(5.0, val))
+            val = (val - 1.0) / 4.0
+        out[key] = round(max(0.0, min(1.0, val)), 4)
+    out["notes"] = str(obj.get("notes") or "").strip()
+    return out
 
 
 async def call_judge_async(
@@ -462,6 +755,61 @@ async def call_judge_async(
         return 0.0
 
 
+async def call_multi_judge_async(
+    question: str,
+    answer_gold: str,
+    answer_pred: str,
+    *,
+    evidence_context: str = "",
+    config_path: Optional[Path] = None,
+    model_key: str = "router_retrieve_llm",
+) -> Dict[str, Any]:
+    """多维度 Judge。"""
+    from src.utils.setting.paths import get_configs_root
+    from src.utils.ai.qwen import QwenClient
+
+    config_path = config_path or (get_configs_root() / "llm.yaml")
+    if not config_path.exists():
+        return parse_multi_judge_result("")
+    with open(config_path, "r", encoding="utf-8") as f:
+        llm_config = yaml.safe_load(f) or {}
+    cfg = llm_config.get(model_key, {})
+    model = cfg.get("model", "qwen-plus")
+
+    client = QwenClient()
+    headers = {
+        "Authorization": f"Bearer {client.api_key}",
+        "Content-Type": "application/json",
+    }
+    data = {
+        "model": model,
+        "input": {
+            "messages": [
+                {"role": "system", "content": _JUDGE_SYSTEM_MULTI},
+                {"role": "user", "content": build_multi_judge_prompt(question, answer_gold, answer_pred, evidence_context)},
+            ]
+        },
+        "parameters": {"max_tokens": 256},
+    }
+    try:
+        import aiohttp
+
+        timeout = aiohttp.ClientTimeout(total=60, connect=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
+                json=data,
+                headers=headers,
+            ) as resp:
+                if resp.status != 200:
+                    return parse_multi_judge_result("")
+                body = await resp.json()
+                text = (body.get("output") or {}).get("text", "") or ""
+                return parse_multi_judge_result(text)
+    except Exception:
+        return parse_multi_judge_result("")
+
+
 def call_judge_sync(
     question: str,
     answer_gold: str,
@@ -474,3 +822,39 @@ def call_judge_sync(
     return asyncio.run(
         call_judge_async(question, answer_gold, answer_pred, judge_mode=judge_mode, **kwargs)
     )
+
+
+def call_multi_judge_sync(
+    question: str,
+    answer_gold: str,
+    answer_pred: str,
+    *,
+    evidence_context: str = "",
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """同步封装：调用多维度 Judge。"""
+    return asyncio.run(
+        call_multi_judge_async(
+            question,
+            answer_gold,
+            answer_pred,
+            evidence_context=evidence_context,
+            **kwargs,
+        )
+    )
+
+
+def percentile(values: List[float], pct: float) -> float:
+    """简单分位数计算。"""
+    nums = sorted(float(x) for x in values if x is not None)
+    if not nums:
+        return 0.0
+    if pct <= 0:
+        return nums[0]
+    if pct >= 100:
+        return nums[-1]
+    idx = (len(nums) - 1) * (pct / 100.0)
+    lower = int(idx)
+    upper = min(lower + 1, len(nums) - 1)
+    weight = idx - lower
+    return round(nums[lower] * (1 - weight) + nums[upper] * weight, 4)

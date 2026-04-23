@@ -1,0 +1,8 @@
+- [ ] PromptParser extracts Method and Indicator entities.
+- [ ] CaseParser extracts CaseStudy, Stakeholder, Event, Risk entities.
+- [ ] MethodologyParser extracts Theory and Guideline entities.
+- [ ] Builder creates Entity and Chunk nodes with correct labels.
+- [ ] Builder creates semantic relationships (HAS_INDICATOR, INVOLVED_IN, etc.).
+- [ ] Vector index supports both Entity (name+desc) and Chunk (content).
+- [ ] ExpertRetriever successfully retrieves Entity nodes and linked Chunks.
+- [ ] Evaluator shows counts for all new entity types.

@@ -42,6 +42,13 @@ def init_schema(seed_platforms: Optional[List[str]] = None) -> None:
         "CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE",
         "CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.id IS UNIQUE",
         "CREATE CONSTRAINT topic_id IF NOT EXISTS FOR (t:Topic) REQUIRE t.id IS UNIQUE",
+        "CREATE CONSTRAINT claim_id IF NOT EXISTS FOR (c:Claim) REQUIRE c.id IS UNIQUE",
+        "CREATE CONSTRAINT event_id IF NOT EXISTS FOR (e:Event) REQUIRE e.id IS UNIQUE",
+        "CREATE CONSTRAINT report_id IF NOT EXISTS FOR (r:Report) REQUIRE r.id IS UNIQUE",
+        "CREATE CONSTRAINT section_id IF NOT EXISTS FOR (s:Section) REQUIRE s.id IS UNIQUE",
+        "CREATE CONSTRAINT finding_id IF NOT EXISTS FOR (f:Finding) REQUIRE f.id IS UNIQUE",
+        "CREATE CONSTRAINT recommendation_id IF NOT EXISTS FOR (r:Recommendation) REQUIRE r.id IS UNIQUE",
+        "CREATE CONSTRAINT metric_id IF NOT EXISTS FOR (m:Metric) REQUIRE m.id IS UNIQUE",
     ]
     _run(constraints, "constraints")
 
@@ -51,8 +58,19 @@ def init_schema(seed_platforms: Optional[List[str]] = None) -> None:
         "CREATE INDEX post_channel IF NOT EXISTS FOR (p:Post) ON (p.channel)",
         "CREATE INDEX post_published_at IF NOT EXISTS FOR (p:Post) ON (p.published_at)",
         "CREATE INDEX chunk_post_id IF NOT EXISTS FOR (c:Chunk) ON (c.post_id)",
+        "CREATE INDEX chunk_topic IF NOT EXISTS FOR (c:Chunk) ON (c.topic)",
+        "CREATE INDEX chunk_chunk_index IF NOT EXISTS FOR (c:Chunk) ON (c.chunk_index)",
         "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)",
         "CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.type)",
+        "CREATE INDEX claim_topic IF NOT EXISTS FOR (c:Claim) ON (c.topic)",
+        "CREATE INDEX event_topic IF NOT EXISTS FOR (e:Event) ON (e.topic_id)",
+        "CREATE INDEX event_project IF NOT EXISTS FOR (e:Event) ON (e.project)",
+        "CREATE INDEX report_topic IF NOT EXISTS FOR (r:Report) ON (r.topic)",
+        "CREATE INDEX report_quarter IF NOT EXISTS FOR (r:Report) ON (r.quarter)",
+        "CREATE INDEX section_report_id IF NOT EXISTS FOR (s:Section) ON (s.report_id)",
+        "CREATE INDEX finding_report_id IF NOT EXISTS FOR (f:Finding) ON (f.report_id)",
+        "CREATE INDEX recommendation_report_id IF NOT EXISTS FOR (r:Recommendation) ON (r.report_id)",
+        "CREATE INDEX metric_report_id IF NOT EXISTS FOR (m:Metric) ON (m.report_id)",
     ]
     _run(indexes, "indexes")
 

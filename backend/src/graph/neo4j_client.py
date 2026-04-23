@@ -23,27 +23,34 @@ def get_driver():
             from neo4j import GraphDatabase
         except ImportError as e:
             raise RuntimeError("请安装 neo4j 驱动: pip install neo4j") from e
+        
         cfg = get_graph_config()
+        # Use cfg.get directly as keys are now merged correctly
         uri = cfg.get("uri", "bolt://localhost:7687")
         user = cfg.get("user", "neo4j")
         password = str(cfg.get("password", ""))
-        _driver = GraphDatabase.driver(uri, auth=(user, password))
+        
         try:
+            _driver = GraphDatabase.driver(uri, auth=(user, password))
             _driver.verify_connectivity()
         except Exception as e:
             LOG.exception("Neo4j 连接验证失败")
-            _driver.close()
+            if _driver:
+                _driver.close()
             _driver = None
-            raise RuntimeError(f"Neo4j 连接失败: {e}") from e
+            raise RuntimeError(f"Neo4j 连接失败: {e}. Config: {uri}, {user}, ***") from e
     return _driver
 
 
 @contextmanager
-def get_session() -> Generator[Any, None, None]:
-    """Context manager 返回 Neo4j 会话。"""
+def get_session(database: Optional[str] = None) -> Generator[Any, None, None]:
+    """Context manager 返回 Neo4j 会话。支持指定 database。"""
     driver = get_driver()
     cfg = get_graph_config()
-    db_name = cfg.get("database")
+    
+    # 优先使用传入的 database，其次使用配置中的 database，最后为 None (使用默认库)
+    db_name = database if database else cfg.get("database")
+    
     if db_name:
         session = driver.session(database=db_name)
     else:

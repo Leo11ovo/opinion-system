@@ -284,6 +284,17 @@ const uploadState = reactive({
   details: null,
   lastResponse: null
 })
+const graphBuildOptions = reactive({
+  enableChunkEmbedding: true,
+  enableEntityExtraction: true,
+  enableLlmExtraction: false
+})
+const graphBuildState = reactive({
+  running: false,
+  success: null,
+  message: '',
+  details: null
+})
 const runHistory = ref([])
 
 // 高级选项：本地缓存重建
@@ -608,12 +619,8 @@ const runUpload = async (options = {}) => {
   uploadState.lastResponse = null
 
   try {
-    const endpoint = await buildApiUrl('/upload')
-    const response = await fetch(endpoint, {
+    const result = await callApi('/upload', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
       body: JSON.stringify(payload)
     })
     let result

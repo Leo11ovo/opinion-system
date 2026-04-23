@@ -70,6 +70,7 @@ from server_support import (  # type: ignore
     get_rag_build_status,
     ensure_routerrag_db,
     ensure_tagrag_db,
+    import_routerrag_artifacts,
     list_project_routerrag_topics,
     list_project_tagrag_topics,
     start_rag_build,
@@ -1059,6 +1060,31 @@ def _run_data_pipeline(topic: str, date: str, *, project: Optional[str] = None, 
         "status": "ok",
         "steps": steps,
     }
+
+
+def _resolve_routerrag_base_path_without_project(topic: str) -> Optional[Path]:
+    """Best-effort fallback: locate a project-local RouterRAG topic when project is missing."""
+    topic = str(topic or "").strip()
+    if not topic:
+        return None
+    matches: List[Path] = []
+    try:
+        if not DATA_PROJECTS_ROOT.exists():
+            return None
+        for project_dir in DATA_PROJECTS_ROOT.iterdir():
+            if not project_dir.is_dir():
+                continue
+            candidate = project_dir / "rag" / "routerrag" / f"{topic}数据库"
+            if (candidate / "vector_db").exists():
+                matches.append(candidate)
+    except Exception:
+        return None
+
+    if not matches:
+        return None
+    # Prefer the most recently updated one.
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches[0]
 
 
 @app.get("/api/status")
@@ -2085,6 +2111,69 @@ def upload_endpoint():
                 "topic": display_name,
                 "bucket": topic_identifier,
                 "prepare_intermediate_from_clean": prepare_intermediate_from_clean,
+            },
+        },
+    )
+    return jsonify(response), code
+
+
+@app.post("/api/graph/build")
+def graph_build_endpoint():
+    payload = request.get_json(silent=True) or {}
+    local_source_dir = str(payload.get("local_source_dir") or "").strip()
+    if local_source_dir:
+        topic_raw = str(payload.get("topic") or payload.get("project") or "").strip()
+        if not topic_raw:
+            return jsonify({"status": "error", "message": "Missing required field(s): topic (or project)"}), 400
+        topic_identifier = PROJECT_MANAGER.resolve_identifier(topic_raw) or topic_raw
+        date = str(payload.get("date") or "report_data").strip() or "report_data"
+        display_name = str(payload.get("topic_label") or topic_raw).strip() or topic_raw
+        log_project = str(payload.get("project") or topic_raw).strip() or topic_raw
+    else:
+        try:
+            topic_identifier, date, display_name, log_project = prepare_pipeline_args(payload, PROJECT_MANAGER)
+        except ValueError as exc:
+            return jsonify({"status": "error", "message": str(exc)}), 400
+
+    from src.graph.sync_mysql_to_neo4j import sync_after_upload  # type: ignore
+
+    def _as_bool(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off", ""}
+        return bool(value)
+
+    init_schema_if_missing = _as_bool(payload.get("init_schema_if_missing"), True)
+    enable_entity_extraction = _as_bool(payload.get("enable_entity_extraction"), True)
+    enable_chunk_embedding = _as_bool(payload.get("enable_chunk_embedding"), True)
+    enable_llm_extraction = _as_bool(payload.get("enable_llm_extraction"), False)
+    source_bucket = "custom" if local_source_dir else (str(payload.get("source_bucket") or "filter").strip() or "filter")
+    dataset_name = local_source_dir or display_name
+
+    response, code = _execute_operation(
+        "graph_sync",
+        sync_after_upload,
+        topic_identifier,
+        date,
+        dataset_name=dataset_name,
+        init_schema_if_missing=init_schema_if_missing,
+        enable_entity_extraction=enable_entity_extraction,
+        enable_chunk_embedding=enable_chunk_embedding,
+        enable_llm_extraction=enable_llm_extraction,
+        source_bucket=source_bucket,
+        log_context={
+            "project": log_project,
+            "params": {
+                "date": date,
+                "source": "api",
+                "topic": display_name,
+                "bucket": topic_identifier,
+                "enable_entity_extraction": enable_entity_extraction,
+                "enable_chunk_embedding": enable_chunk_embedding,
+                "enable_llm_extraction": enable_llm_extraction,
             },
         },
     )
@@ -3562,6 +3651,7 @@ def root():
         "/api/clean",
         "/api/filter",
         "/api/upload",
+        "/api/graph/build",
         "/api/query",
         "/api/fetch",
         "/api/analyze",
@@ -3701,18 +3791,37 @@ def get_rag_cache_status():
 
 @app.post("/api/rag/build")
 def rag_build():
+    def _as_bool(value, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off", ""}
+        return bool(value)
+
     payload = request.get_json(silent=True) or {}
     topic = str(payload.get("topic") or "").strip()
     project = str(payload.get("project") or "").strip()
     rag_type = str(payload.get("type") or "").strip() or "tagrag"
+    source_type = str(payload.get("source_type") or "").strip() or "remote"
+    local_source_dir = str(payload.get("local_source_dir") or "").strip() or None
     start = str(payload.get("start") or "").strip() or None
     end = str(payload.get("end") or "").strip() or None
+    sample_ratio = payload.get("sample_ratio")
+    chunk_mode = str(payload.get("chunk_mode") or "sentence").strip() or "sentence"
+    chunk_size = int(payload.get("chunk_size") or 220)
+    chunk_overlap = int(payload.get("chunk_overlap") or 40)
+    force_rebuild = _as_bool(payload.get("force_rebuild"), False)
 
     if not topic or not project:
         return error("Missing required field(s): project, topic")
 
     project_bucket = PROJECT_MANAGER.resolve_identifier(project) if project else None
     project_bucket = project_bucket or project
+
+    if source_type == "report_data" and not local_source_dir:
+        local_source_dir = str(get_data_root() / "report_data")
 
     status = start_rag_build(
         project_bucket,
@@ -3721,8 +3830,40 @@ def rag_build():
         db_topic=topic,
         start=start,
         end=end,
+        local_source_dir=local_source_dir,
+        sample_ratio=sample_ratio,
+        chunk_mode=chunk_mode,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        force_rebuild=force_rebuild,
     )
     return success({"data": status})
+
+
+@app.post("/api/rag/routerrag/import")
+def import_routerrag_index():
+    """手动导入现有 RouterRAG 索引产物（.lance / vector_db / topic root）。"""
+    try:
+        payload = request.get_json(silent=True) or {}
+        topic = str(payload.get("topic") or "").strip()
+        project = str(payload.get("project") or "").strip()
+        source_path = str(payload.get("source_path") or "").strip()
+
+        if not topic or not project or not source_path:
+            return error("Missing required field(s): project, topic, source_path")
+
+        project_bucket = PROJECT_MANAGER.resolve_identifier(project) if project else None
+        project_bucket = project_bucket or project
+
+        result = import_routerrag_artifacts(
+            project=project_bucket,
+            topic=topic,
+            source_path=source_path,
+        )
+        return success({"data": result})
+    except Exception as exc:
+        LOGGER.exception("Failed to import RouterRAG artifacts")
+        return error(f"导入RouterRAG索引失败: {str(exc)}")
 
 
 @app.post("/api/rag/tagrag/retrieve")
@@ -3780,6 +3921,15 @@ def routerrag_retrieve():
     try:
         payload = request.get_json(silent=True) or {}
 
+        def _as_bool(value, default: bool = True) -> bool:
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.strip().lower() not in {"0", "false", "no", "off", ""}
+            return bool(value)
+
         # Validate required fields
         query = payload.get("query", "").strip()
         topic = payload.get("topic", "").strip()
@@ -3807,15 +3957,28 @@ def routerrag_retrieve():
         base_path = None
         if project_bucket:
             base_path = ensure_routerrag_db(topic, project_bucket)
+        else:
+            base_path = _resolve_routerrag_base_path_without_project(topic)
 
         # Retrieve documents
         mode = payload.get("mode", "normalrag")
+        question_type = str(payload.get("question_type") or "").strip() or None
+        experiment_tag = str(payload.get("experiment_tag") or "default").strip() or "default"
+        trace_id = str(payload.get("trace_id") or "").strip() or None
         results = retrieve_documents(
             query=query,
             topic=topic,
             top_k=top_k,
             threshold=payload.get("threshold", 0.0),
             mode=mode,
+            enable_expert_overlay=_as_bool(payload.get("enable_expert_overlay"), True),
+            enable_expert_rewrite=_as_bool(payload.get("enable_expert_rewrite"), True),
+            enable_expert_hints=_as_bool(payload.get("enable_expert_hints"), True),
+            enable_expert_answer_structure=_as_bool(payload.get("enable_expert_answer_structure"), True),
+            question_type=question_type,
+            experiment_tag=experiment_tag,
+            trace_id=trace_id,
+            use_question_preset=_as_bool(payload.get("use_question_preset"), True),
             db_base_path=base_path,
         )
 
@@ -3825,6 +3988,176 @@ def routerrag_retrieve():
     except Exception as exc:
         LOGGER.exception("Failed to retrieve RouterRAG documents")
         return error(f"RouterRAG检索失败: {str(exc)}")
+
+
+@app.post("/api/rag/routerrag/feedback")
+def routerrag_feedback_submit():
+    """RouterRAG 反馈提交接口（轻量本地JSONL存储）"""
+    try:
+        payload = request.get_json(silent=True) or {}
+        topic = str(payload.get("topic") or "").strip()
+        if not topic:
+            return error("Missing required field: topic")
+
+        from src.rag.feedback.store import append_feedback
+
+        record = append_feedback(
+            topic=topic,
+            record={
+                "trace_id": str(payload.get("trace_id") or "").strip(),
+                "experiment_tag": str(payload.get("experiment_tag") or "default").strip() or "default",
+                "question": str(payload.get("question") or "").strip(),
+                "question_type": str(payload.get("question_type") or "").strip(),
+                "scores": payload.get("scores") if isinstance(payload.get("scores"), dict) else {},
+                "bad_reason": str(payload.get("bad_reason") or "").strip(),
+                "note": str(payload.get("note") or "").strip(),
+                "operator": str(payload.get("operator") or "").strip(),
+                "user_score_relevance": payload.get("user_score_relevance"),
+                "user_score_usefulness": payload.get("user_score_usefulness"),
+                "user_score_trust": payload.get("user_score_trust"),
+                "manual_ux_score": payload.get("manual_ux_score"),
+            },
+        )
+        return success({"data": record})
+    except Exception as exc:
+        LOGGER.exception("Failed to submit RouterRAG feedback")
+        return error(f"RouterRAG反馈提交失败: {str(exc)}")
+
+
+@app.get("/api/rag/routerrag/feedback")
+def routerrag_feedback_list():
+    """RouterRAG 反馈查询接口"""
+    try:
+        topic = str(request.args.get("topic") or "").strip()
+        if not topic:
+            return error("Missing required field: topic")
+
+        limit = int(request.args.get("limit") or 100)
+        experiment_tag = str(request.args.get("experiment_tag") or "").strip() or None
+
+        from src.rag.feedback.store import list_feedback
+
+        records = list_feedback(topic=topic, limit=limit, experiment_tag=experiment_tag)
+        return success({"data": {"topic": topic, "total": len(records), "records": records}})
+    except Exception as exc:
+        LOGGER.exception("Failed to list RouterRAG feedback")
+        return error(f"RouterRAG反馈查询失败: {str(exc)}")
+
+
+@app.get("/api/rag/routerrag/feedback/summary")
+def routerrag_feedback_summary():
+    """RouterRAG 反馈摘要接口。"""
+    try:
+        topic = str(request.args.get("topic") or "").strip()
+        if not topic:
+            return error("Missing required field: topic")
+
+        limit = int(request.args.get("limit") or 1000)
+        experiment_tag = str(request.args.get("experiment_tag") or "").strip() or None
+
+        from src.rag.feedback.store import summarize_feedback
+
+        summary = summarize_feedback(topic=topic, limit=limit, experiment_tag=experiment_tag)
+        return success({"data": summary})
+    except Exception as exc:
+        LOGGER.exception("Failed to summarize RouterRAG feedback")
+        return error(f"RouterRAG反馈摘要失败: {str(exc)}")
+
+
+@app.get("/api/rag/routerrag/rlhf/stats")
+def routerrag_rlhf_stats():
+    """RLHF feedback stats for RouterRAG."""
+    try:
+        topic = str(request.args.get("topic") or "").strip()
+        if not topic:
+            return error("Missing required field: topic")
+
+        experiment_tag = str(request.args.get("experiment_tag") or "").strip() or None
+        limit = int(request.args.get("limit") or 1000)
+
+        from src.rag.feedback.rlhf_tuner import build_feedback_stats
+
+        stats = build_feedback_stats(topic=topic, limit=limit, experiment_tag=experiment_tag)
+        return success({"data": stats})
+    except Exception as exc:
+        LOGGER.exception("Failed to compute RouterRAG RLHF stats")
+        return error(f"RouterRAG RLHF统计失败: {str(exc)}")
+
+
+@app.post("/api/rag/routerrag/rlhf/tune")
+def routerrag_rlhf_tune():
+    """Tune RouterRAG retrieval params from feedback (RLHF-style heuristic)."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        topic = str(payload.get("topic") or "").strip()
+        if not topic:
+            return error("Missing required field: topic")
+
+        experiment_tag = str(payload.get("experiment_tag") or "").strip() or None
+        limit = int(payload.get("limit") or 1000)
+        apply_change = bool(payload.get("apply", False))
+        operator = str(payload.get("operator") or "").strip()
+
+        from src.rag.feedback.rlhf_tuner import (
+            build_feedback_stats,
+            save_tuning_snapshot,
+            suggest_retrieval_update,
+        )
+
+        stats = build_feedback_stats(topic=topic, limit=limit, experiment_tag=experiment_tag)
+        current_config = load_rag_config()
+        current_retrieval = current_config.get("retrieval", {}) if isinstance(current_config, dict) else {}
+        suggested_retrieval, reasons = suggest_retrieval_update(
+            current_retrieval=current_retrieval,
+            stats=stats,
+        )
+
+        applied = False
+        min_feedback_required = 8
+        total_feedback = int(stats.get("total_feedback") or 0)
+        blocked_reason = ""
+        if apply_change and total_feedback < min_feedback_required:
+            blocked_reason = f"反馈样本不足（{total_feedback}<{min_feedback_required}），已阻止写入配置"
+            applied = False
+        elif apply_change:
+            if not isinstance(current_config, dict):
+                current_config = {}
+            if "retrieval" not in current_config or not isinstance(current_config.get("retrieval"), dict):
+                current_config["retrieval"] = {}
+            current_config["retrieval"].update(suggested_retrieval)
+            persist_rag_config(current_config)
+            applied = True
+
+        snapshot = {
+            "topic": topic,
+            "experiment_tag": experiment_tag or "all",
+            "operator": operator,
+            "stats": stats,
+            "current_retrieval": current_retrieval,
+            "suggested_retrieval": suggested_retrieval,
+            "reasons": reasons,
+            "applied": applied,
+            "blocked_reason": blocked_reason,
+        }
+        snapshot_path = save_tuning_snapshot(topic=topic, payload=snapshot)
+
+        return success(
+            {
+                "data": {
+                    "topic": topic,
+                    "stats": stats,
+                    "current_retrieval": current_retrieval,
+                    "suggested_retrieval": suggested_retrieval,
+                    "reasons": reasons,
+                    "applied": applied,
+                    "blocked_reason": blocked_reason,
+                    "snapshot_path": str(snapshot_path),
+                }
+            }
+        )
+    except Exception as exc:
+        LOGGER.exception("Failed to tune RouterRAG via RLHF")
+        return error(f"RouterRAG RLHF调参失败: {str(exc)}")
 
 
 @app.post("/api/rag/universal/retrieve")
@@ -3927,7 +4260,7 @@ def universal_rag_retrieve():
 
 @app.post("/api/rag/evaluate")
 def rag_evaluate():
-    """RAG 评估接口：Precision、Recall、LLM Judge（仅 RouterRAG）"""
+    """RAG 评估接口：检索、生成、UX 代理评估（仅 RouterRAG）"""
     try:
         payload = request.get_json(silent=True) or {}
         topic = (payload.get("topic") or "").strip()
@@ -3937,6 +4270,12 @@ def rag_evaluate():
         judge_mode = payload.get("judge_mode", "with_reference")
         fill_relevant_docs_with_keywords = payload.get("fill_relevant_docs_with_keywords", True)
         relevant_method = payload.get("relevant_method", "embedding")
+        experiment_tag = str(payload.get("experiment_tag") or "default").strip() or "default"
+        compare_tag = str(payload.get("compare_tag") or "").strip()
+        eval_scope = str(payload.get("eval_scope") or "all").strip() or "all"
+        top_k = int(payload.get("top_k") or 10)
+        include_breakdown = bool(payload.get("include_breakdown", True))
+        manual_feedback_path = str(payload.get("manual_feedback_path") or "").strip()
 
         if not topic:
             return error("Missing required field: topic")
@@ -3944,21 +4283,44 @@ def rag_evaluate():
             return error("Missing required field: eval_data_path")
 
         from pathlib import Path
-        from src.rag.evaluator import run_evaluation
+        from src.rag.evaluator import run_evaluation, run_evaluation_compare
 
         path = Path(eval_data_path)
         if not path.is_file():
             return error("eval_data_path is not an existing file")
+        feedback_path = Path(manual_feedback_path) if manual_feedback_path else None
 
-        result = run_evaluation(
-            topic=topic,
-            eval_data_path=path,
-            mode=mode,
-            use_judge=use_judge,
-            judge_mode=judge_mode,
-            fill_relevant_docs_with_keywords=fill_relevant_docs_with_keywords,
-            relevant_method=relevant_method,
-        )
+        if compare_tag:
+            result = run_evaluation_compare(
+                topic=topic,
+                eval_data_path=path,
+                mode=mode,
+                baseline_tag=experiment_tag,
+                candidate_tag=compare_tag,
+                use_judge=use_judge,
+                judge_mode=judge_mode,
+                fill_relevant_docs_with_keywords=fill_relevant_docs_with_keywords,
+                relevant_method=relevant_method,
+                eval_scope=eval_scope,
+                top_k=top_k,
+                include_breakdown=include_breakdown,
+                manual_feedback_path=feedback_path,
+            )
+        else:
+            result = run_evaluation(
+                topic=topic,
+                eval_data_path=path,
+                mode=mode,
+                use_judge=use_judge,
+                judge_mode=judge_mode,
+                fill_relevant_docs_with_keywords=fill_relevant_docs_with_keywords,
+                relevant_method=relevant_method,
+                experiment_tag=experiment_tag,
+                eval_scope=eval_scope,
+                top_k=top_k,
+                include_breakdown=include_breakdown,
+                manual_feedback_path=feedback_path,
+            )
         return success(result)
     except Exception as exc:
         LOGGER.exception("RAG evaluate failed")

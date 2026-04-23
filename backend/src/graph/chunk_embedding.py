@@ -33,7 +33,7 @@ def write_chunks_for_post(
     post_id_raw: str,
     contents: str,
     *,
-    chunk_size: int = 300,
+    chunk_size: int = 512,
     chunk_overlap: int = 50,
 ) -> int:
     """
@@ -51,9 +51,17 @@ def write_chunks_for_post(
                 tx.run(
                     """
                     MERGE (c:Chunk {id: $id})
-                    SET c.post_id = $post_id, c.chunk_index = $chunk_index, c.text = $text
+                    SET c.post_id = $post_id, c.chunk_index = $chunk_index, c.text = $text,
+                        c.topic = $topic, c.channel = $channel
                     """,
-                    {"id": chunk_id, "post_id": post_global_id, "chunk_index": chunk_index, "text": chunk_text},
+                    {
+                        "id": chunk_id,
+                        "post_id": post_global_id,
+                        "chunk_index": chunk_index,
+                        "text": chunk_text,
+                        "topic": topic,
+                        "channel": channel,
+                    },
                 )
                 tx.run(
                     """

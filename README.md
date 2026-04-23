@@ -942,7 +942,7 @@ python main.py RouterVectorize --topic 控烟
 **处理流程**:
 1. 文本处理: 清洗、合并、切句
 2. 实体关系提取: 使用Qwen-Plus提取知识图谱
-3. 向量生成: 生成实体、关系、句子、标签向量
+3. 向量生成: 生成句子与文本标签向量
 4. 数据去重: 实体和关系的智能去重
 5. 存储: 保存到LanceDB向量数据库
 
@@ -959,8 +959,6 @@ src/utils/rag/ragrouter/{主题}数据库/
 │       └── data_mapping.json
 └── vector_db/           # LanceDB向量数据库
     ├── normalrag        # 句子向量表
-    ├── graphrag_entities      # 实体向量表
-    ├── graphrag_relationships # 关系向量表
     └── graphrag_texts         # 文本标签向量表
 ```
 

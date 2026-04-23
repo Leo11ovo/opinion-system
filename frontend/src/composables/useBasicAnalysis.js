@@ -1,5 +1,6 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { useApiBase } from './useApiBase'
+import { useActiveProject } from './useActiveProject'
 import {
   normaliseArchiveRecords,
   normaliseRecord,
@@ -15,23 +16,35 @@ const ANALYZE_ACTIVE_STATUSES = new Set(['queued', 'running'])
 const ANALYZE_FUNCTION_ORDER = new Map(analysisFunctions.map((item, index) => [item.id, index]))
 
 const { callApi } = useApiBase()
+const { activeProjectName } = useActiveProject()
 
 const topicsState = reactive({
   loading: false,
   error: '',
-  options: []
+  options: [],
+  remoteOptions: [],
+  localOptions: []
 })
 
 const topicOptions = computed(() => topicsState.options)
+const sourceTypeOptions = [
+  { value: 'remote', label: '远程专题' },
+  { value: 'local', label: '本地数据集' }
+]
+const activeSourceType = computed(() => analyzeForm.source_type || fetchForm.source_type || 'remote')
 
 const fetchForm = reactive({
+  source_type: 'remote',
   topic: '',
+  dataset_id: '',
   start: '',
   end: ''
 })
 
 const analyzeForm = reactive({
+  source_type: 'remote',
   topic: '',
+  dataset_id: '',
   start: '',
   end: ''
 })
@@ -144,6 +157,11 @@ export const useBasicAnalysis = () => {
   analysisSummary,
   analysisAiSummary,
   analysisSections,
+  sourceTypeOptions,
+  activeSourceType,
+  activeProjectName,
+  getTopicLabel,
+  setSourceType,
   changeTopic,
   loadTopics,
   resetFetchForm,
@@ -166,6 +184,25 @@ function initializeStore() {
   loadTopics()
 
   watch(topicOptions, ensureTopicSelection, { immediate: true })
+
+  watch(
+    () => analyzeForm.source_type,
+    (value) => {
+      fetchForm.source_type = value || 'remote'
+      ensureTopicSelection()
+      loadAvailableRange()
+    },
+    { immediate: true }
+  )
+
+  watch(
+    activeProjectName,
+    async () => {
+      await loadTopics()
+      ensureTopicSelection()
+      await loadAvailableRange()
+    }
+  )
 
   watch(
     () => fetchForm.topic,
@@ -270,10 +307,19 @@ const changeTopic = (value) => {
   const next = (value || '').trim()
   fetchForm.topic = next
   analyzeForm.topic = next
+  if (activeSourceType.value === 'local') {
+    fetchForm.dataset_id = next
+    analyzeForm.dataset_id = next
+  } else {
+    fetchForm.dataset_id = ''
+    analyzeForm.dataset_id = ''
+  }
   loadAvailableRange()
 }
 
 const ensureTopicSelection = () => {
+  const options = activeSourceType.value === 'local' ? topicsState.localOptions : topicsState.remoteOptions
+  topicsState.options = options
   if (!topicOptions.value.length) return
   if (!fetchForm.topic || !topicOptions.value.includes(fetchForm.topic)) {
     fetchForm.topic = topicOptions.value[0]
@@ -286,6 +332,10 @@ const ensureTopicSelection = () => {
   }
   if (!viewManualForm.topic) {
     viewManualForm.topic = fetchForm.topic
+  }
+  if (activeSourceType.value === 'local') {
+    fetchForm.dataset_id = fetchForm.topic
+    analyzeForm.dataset_id = analyzeForm.topic || fetchForm.topic
   }
 }
 
@@ -312,6 +362,7 @@ const applyAvailableRangeToForms = () => {
 
 const loadAvailableRange = async () => {
   const topic = (fetchForm.topic || '').trim()
+  const sourceType = activeSourceType.value
   if (!topic) {
     availableRange.loading = false
     clearAvailableRange()
@@ -326,12 +377,25 @@ const loadAvailableRange = async () => {
   analyzeForm.start = ''
   analyzeForm.end = ''
   try {
-    const params = new URLSearchParams({ topic })
-    const response = await callApi(`/api/fetch/availability?${params.toString()}`, { method: 'GET' })
+    let response = null
+    if (sourceType === 'local') {
+      const project = (activeProjectName.value || '').trim()
+      const datasetId = (fetchForm.dataset_id || topic).trim()
+      if (!project || !datasetId) {
+        throw new Error('本地数据源缺少 project 或 dataset_id')
+      }
+      const params = new URLSearchParams({ dataset_id: datasetId })
+      response = await callApi(`/api/projects/${encodeURIComponent(project)}/date-range?${params.toString()}`, { method: 'GET' })
+    } else {
+      const params = new URLSearchParams({ topic })
+      response = await callApi(`/api/fetch/availability?${params.toString()}`, { method: 'GET' })
+    }
     if (requestId !== availabilityRequestId) return
-    const range = response?.data?.range ?? {}
-    availableRange.start = range.start || ''
-    availableRange.end = range.end || ''
+    const range = response?.data?.range ?? response?.range ?? {}
+    const minDate = response?.data?.min_date || response?.min_date || range.start || ''
+    const maxDate = response?.data?.max_date || response?.max_date || range.end || ''
+    availableRange.start = range.start || minDate || ''
+    availableRange.end = range.end || maxDate || ''
     applyAvailableRangeToForms()
   } catch (error) {
     if (requestId !== availabilityRequestId) return
@@ -358,23 +422,52 @@ const loadTopics = async () => {
       body: JSON.stringify({ include_counts: false })
     })
     const databases = response?.data?.databases ?? []
-    topicsState.options = databases
+    topicsState.remoteOptions = databases
       .map((db) => String(db?.name || '').trim())
       .filter((name, index, arr) => name && arr.indexOf(name) === index)
+
+    const project = (activeProjectName.value || '').trim()
+    if (project) {
+      const localResp = await callApi(`/api/projects/${encodeURIComponent(project)}/datasets`, { method: 'GET' })
+      const datasets = localResp?.datasets || []
+      topicsState.localOptions = datasets
+        .map((ds) => String(ds?.id || '').trim())
+        .filter((name, index, arr) => name && arr.indexOf(name) === index)
+    } else {
+      topicsState.localOptions = []
+    }
+
     ensureTopicSelection()
     const hasInitialSelection = !previousTopic && (fetchForm.topic || '').trim()
     if (hasInitialSelection || fetchForm.topic === previousTopic) {
       await loadAvailableRange()
     }
   } catch (error) {
-    topicsState.error = error instanceof Error ? error.message : '加载远程数据源失败'
+    topicsState.error = error instanceof Error ? error.message : '加载数据源失败'
     topicsState.options = []
+    topicsState.remoteOptions = []
+    topicsState.localOptions = []
     fetchForm.topic = ''
+    fetchForm.dataset_id = ''
     analyzeForm.topic = ''
+    analyzeForm.dataset_id = ''
     clearAvailableRange()
   } finally {
     topicsState.loading = false
   }
+}
+
+const setSourceType = (value) => {
+  const next = value === 'local' ? 'local' : 'remote'
+  analyzeForm.source_type = next
+  fetchForm.source_type = next
+  ensureTopicSelection()
+}
+
+const getTopicLabel = (value) => {
+  if (!value) return ''
+  if (activeSourceType.value !== 'local') return value
+  return value
 }
 
 const loadHistory = async (topic) => {
@@ -660,6 +753,9 @@ const deriveRangeFromFolder = (folderValue, startValue, endValue) => {
 const runFetch = async (rangeOverride = null, options = {}) => {
   const range = normalizeRange(rangeOverride || fetchForm)
   const { topic, start, end } = range
+  if (activeSourceType.value === 'local') {
+    return true
+  }
   const { logId = null, label = 'Fetch', silent = false } = options
 
   if (!topic || !start || !end) {

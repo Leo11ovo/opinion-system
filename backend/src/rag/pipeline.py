@@ -45,6 +45,12 @@ class RAGPipeline(BaseRAG):
                 model_name=self.config.embedding.model_name,
                 device=self.config.embedding.device
             )
+        elif self.config.embedding.model_type in ["openai", "qwen"]:
+            from .embeddings.openai_embedder import OpenAIEmbedder
+            return OpenAIEmbedder(
+                model_name=self.config.embedding.model_name,
+                dimension=self.config.embedding.dimension
+            )
         else:
             raise ValueError(f"Unsupported embedder type: {self.config.embedding.model_type}")
 

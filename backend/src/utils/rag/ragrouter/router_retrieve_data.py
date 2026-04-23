@@ -7,6 +7,7 @@ import json
 import lancedb
 import yaml
 import re
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -16,6 +17,80 @@ from ...setting.env_loader import get_api_key
 from ...setting.settings import settings
 from ...logging.logging import setup_logger, log_success, log_error, log_module_start
 from ...ai.qwen import QwenClient
+from src.rag.retrievers import GraphRAGFormatter, GraphRAGRetriever
+
+QUESTION_TYPE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "fact": {
+        "mode": "normalrag",
+        "topk_graphrag": 3,
+        "topk_normalrag": 8,
+        "topk_tagrag": 2,
+        "enable_expert_overlay": False,
+        "enable_expert_rewrite": False,
+        "enable_expert_hints": False,
+        "enable_expert_answer_structure": False,
+        "llm_summary_mode": "strict",
+    },
+    "explain": {
+        "mode": "mixed",
+        "topk_graphrag": 4,
+        "topk_normalrag": 8,
+        "topk_tagrag": 3,
+        "enable_expert_overlay": True,
+        "enable_expert_rewrite": True,
+        "enable_expert_hints": True,
+        "enable_expert_answer_structure": True,
+        "llm_summary_mode": "supplement",
+    },
+    "compare": {
+        "mode": "mixed",
+        "topk_graphrag": 5,
+        "topk_normalrag": 10,
+        "topk_tagrag": 4,
+        "enable_expert_overlay": True,
+        "enable_expert_rewrite": True,
+        "enable_expert_hints": True,
+        "enable_expert_answer_structure": True,
+        "llm_summary_mode": "supplement",
+    },
+    "decision": {
+        "mode": "mixed",
+        "topk_graphrag": 6,
+        "topk_normalrag": 10,
+        "topk_tagrag": 5,
+        "enable_expert_overlay": True,
+        "enable_expert_rewrite": True,
+        "enable_expert_hints": True,
+        "enable_expert_answer_structure": True,
+        "llm_summary_mode": "supplement",
+    },
+    "explore": {
+        "mode": "mixed",
+        "topk_graphrag": 3,
+        "topk_normalrag": 8,
+        "topk_tagrag": 3,
+        "enable_expert_overlay": True,
+        "enable_expert_rewrite": True,
+        "enable_expert_hints": True,
+        "enable_expert_answer_structure": True,
+        "llm_summary_mode": "strict",
+    },
+}
+
+
+def detect_question_type(query: str) -> str:
+    text = str(query or "").strip()
+    if not text:
+        return "explore"
+    if re.search(r"(怎么办|如何应对|策略|建议|处置|治理)", text):
+        return "decision"
+    if re.search(r"(对比|比较|差异|像不像|相似|类似)", text):
+        return "compare"
+    if re.search(r"(为什么|原因|机理|如何解释|背后)", text):
+        return "explain"
+    if re.search(r"(发生了什么|谁|哪里|多少|何时|数据|现状)", text):
+        return "fact"
+    return "explore"
 
 
 def get_available_router_topics():
@@ -60,21 +135,17 @@ class SearchParams:
     query_topic: str
     query_text: str
     search_mode: str  # mixed/graphrag/normalrag/tagrag
-    topk_graphrag: int = 3  # GraphRAG返回的核心实体数量（固定前3个，扩展其所有关系）
+    topk_graphrag: int = 3  # Neo4j GraphRAG返回命中数量上限
     topk_normalrag: int = 5
     topk_tagrag: int = 5
     enable_query_expansion: bool = True  # 是否启用查询扩展/重写
     enable_llm_summary: bool = True  # 是否启用LLM整理结果
     llm_summary_mode: str = "strict"  # strict(严格模式)/supplement(补充模式)
     return_format: str = "both"  # both(都返回)/llm_only(仅LLM整理)/index_only(仅索引结果)
-
-
-@dataclass
-class GraphRAGResult:
-    """GraphRAG检索结果"""
-    entities: List[Dict]
-    relationships: List[Dict]
-    multi_hop_paths: List[Dict]
+    enable_expert_overlay: bool = True  # 是否启用专家图谱外挂
+    enable_expert_rewrite: bool = True  # 是否启用专家查询改写
+    enable_expert_hints: bool = True  # 是否启用专家提示重排
+    enable_expert_answer_structure: bool = True  # 是否启用结构化回答模板
 
 
 @dataclass
@@ -102,15 +173,31 @@ class LLMHelper:
     def _load_prompts(self, prompts_file: str) -> Dict[str, Any]:
         """加载提示词配置文件"""
         try:
-            # 使用相对于configs的路径
-            prompts_path = get_configs_root() / "prompt" / "router_retrieve" / prompts_file
-            if prompts_path.exists():
-                with open(prompts_path, 'r', encoding='utf-8') as f:
-                    prompts = yaml.safe_load(f)
-                    return prompts
-            else:
-                log_error(self.logger, f"提示词文件不存在: {prompts_file}，使用默认配置", "llm")
-                return {}
+            prompts_dir = get_configs_root() / "prompt" / "router_retrieve"
+            candidates = [prompts_file, "默认.yaml", "控烟.yaml", "test.yaml"]
+            seen = set()
+            ordered_candidates = []
+            for name in candidates:
+                key = str(name or "").strip()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                ordered_candidates.append(key)
+
+            for name in ordered_candidates:
+                prompts_path = prompts_dir / name
+                if not prompts_path.exists():
+                    continue
+                with open(prompts_path, "r", encoding="utf-8") as f:
+                    prompts = yaml.safe_load(f) or {}
+                if not isinstance(prompts, dict):
+                    continue
+                if name != prompts_file:
+                    log_error(self.logger, f"提示词文件不存在或不可用: {prompts_file}，已回退到 {name}", "llm")
+                return prompts
+
+            log_error(self.logger, f"未找到可用提示词文件: {prompts_file}", "llm")
+            return {}
         except Exception as e:
             log_error(self.logger, f"加载提示词配置失败: {str(e)}", "llm")
             return {}
@@ -206,62 +293,134 @@ class LLMHelper:
         """
         # 构建上下文
         context_parts = []
-        
-        # GraphRAG结果
+        neo4jrag = search_results.get("neo4jrag", {}) or {}
+        expert_nodes = neo4jrag.get("expert_nodes", []) if isinstance(neo4jrag, dict) else []
+        expert_guidance_text = str(search_results.get("expert_guidance") or "").strip()
+        has_expert_evidence = bool(expert_guidance_text or expert_nodes)
+
+        context_parts.append(
+            "【Evidence Priority】\n"
+            "1) 事实证据: Opinion业务图谱命中\n"
+            "2) 专家图谱: 仅用于任务拆解、方法选择、回答结构约束（非事实证据）\n"
+            "严禁把专家图谱节点/指导文本当作事实依据。"
+        )
+
+        # Planning Context + Answer Structure（外挂层，仅影响总结提示词）
+        retrieval_plan = search_results.get("retrieval_plan") or {}
+        answer_structure = search_results.get("answer_structure") or {}
+        if answer_structure.get("applied") and retrieval_plan:
+            route_steps = retrieval_plan.get("route", {}).get("steps", []) or []
+            route_text = []
+            for step in route_steps:
+                stage = str(step.get("stage") or "").strip()
+                items = [str(x).strip() for x in (step.get("items") or []) if str(x).strip()]
+                if stage and items:
+                    route_text.append(f"- {stage}: {', '.join(items)}")
+            context_parts.append(
+                "【Planning Context】\n"
+                f"- scenario: {', '.join(retrieval_plan.get('scenario', []) or [])}\n"
+                f"- goals: {', '.join(retrieval_plan.get('goals', []) or [])}\n"
+                f"- dimensions: {', '.join(retrieval_plan.get('dimensions', []) or [])}\n"
+                f"- tasks: {', '.join(retrieval_plan.get('tasks', []) or [])}\n"
+                f"- methods: {', '.join(retrieval_plan.get('methods', []) or [])}\n"
+                f"{chr(10).join(route_text)}\n\n"
+                "【Answer Template】\n"
+                "请按以下结构组织回答：\n"
+                "1) Task\n2) Method\n3) Evidence\n4) Conclusion/Gap"
+            )
+
+        # Neo4j Expert结果（主图谱来源）
+        if expert_guidance_text:
+            context_parts.append("\n【专家图谱指导（仅方向，不可作事实证据）】")
+            context_parts.append(expert_guidance_text)
+
+        if expert_nodes:
+            context_parts.append("\n【Neo4j专家图谱命中（仅方向，不可作事实证据）】")
+            for i, node in enumerate(expert_nodes, 1):
+                name = node.get("entity_name") or "未知节点"
+                labels = ",".join(node.get("labels") or [])
+                text = str(node.get("text_content") or "")
+                source = node.get("source_doc") or ""
+                connections = node.get("connections") or []
+                context_parts.append(f"\n命中{i}: {name} ({labels})")
+                context_parts.append(f"内容: {text}")
+                if source:
+                    context_parts.append(f"来源: {source}")
+                if connections:
+                    conn = ", ".join([str(c.get("name") or "") for c in connections if c.get("name")])
+                    if conn:
+                        context_parts.append(f"关联: {conn}")
+
+        # opinion业务图谱结果（finding-centric）
+        opinion_graph = search_results.get("opinion_graph", {}) or {}
+        graph_hits = opinion_graph.get("hits", []) if isinstance(opinion_graph, dict) else []
+        if graph_hits:
+            context_parts.append("\n【Opinion业务图谱 Finding 命中】")
+            capped_hits = graph_hits[:6] if has_expert_evidence else graph_hits
+            for i, hit in enumerate(capped_hits, 1):
+                seed = hit.get("seed") or {}
+                context_parts.append(
+                    f"\n命中{i}: Finding={hit.get('finding_title') or hit.get('finding_id') or ''} "
+                    f"score={hit.get('score', '')} seed={seed.get('label', '')}:{seed.get('node_id', '')} mode={seed.get('mode', '')}"
+                )
+                if hit.get("finding_statement"):
+                    context_parts.append(f"结论: {str(hit.get('finding_statement') or '')}")
+                if hit.get("topics"):
+                    context_parts.append(f"Topics: {', '.join([str(x) for x in hit.get('topics', []) if x])}")
+                if hit.get("platforms"):
+                    context_parts.append(f"Platforms: {', '.join([str(x) for x in hit.get('platforms', []) if x])}")
+                if hit.get("events"):
+                    context_parts.append(f"Events: {', '.join([str(x) for x in hit.get('events', []) if x])}")
+                if hit.get("claims"):
+                    context_parts.append(f"Claims: {'; '.join([str(x) for x in hit.get('claims', []) if x])}")
+                if hit.get("post_titles"):
+                    context_parts.append(f"Posts: {'; '.join([str(x) for x in hit.get('post_titles', []) if x])}")
+                if hit.get("recommendations"):
+                    context_parts.append(f"Recommendations: {'; '.join([str(x) for x in hit.get('recommendations', []) if x])}")
+                related = hit.get("related_findings") or []
+                if related:
+                    context_parts.append(
+                        "Related: " + "; ".join([str(x.get("finding_title") or x.get("finding_id") or "") for x in related if isinstance(x, dict)])
+                    )
+
+        # GraphRAG结果（finding/evidence 统一口径）
         if 'graphrag' in search_results and search_results['graphrag']:
             graphrag = search_results['graphrag']
-            entities = graphrag.get('entities', {})
-            relationships = graphrag.get('relationships', {})
-            
-            # 核心实体（使用完整描述）
-            core_entities = entities.get('core', []) if isinstance(entities, dict) else entities
-            if core_entities:
-                context_parts.append("【核心实体】")
-                for i, e in enumerate(core_entities, 1):
-                    desc = e.get('description', '')
-                    desc_text = desc if isinstance(desc, str) else str(desc)
-                    context_parts.append(f"\n实体{i}: {e['name']}（{e['type']}）")
-                    context_parts.append(f"描述: {desc_text}")  # 完整描述
-            
-            # 扩展实体（使用完整描述，数量不限制，全部传递）
-            extended_entities = entities.get('extended', []) if isinstance(entities, dict) else []
-            if extended_entities:
-                context_parts.append("\n【扩展实体】")
-                for i, e in enumerate(extended_entities, 1):  # 使用所有扩展实体
-                    desc = e.get('description', '')
-                    desc_text = desc if isinstance(desc, str) else str(desc)
-                    context_parts.append(f"\n扩展实体{i}: {e['name']}（{e['type']}）")
-                    context_parts.append(f"描述: {desc_text}")  # 完整描述
-            
-            # Top3关系（使用完整描述）
-            top3_relationships = relationships.get('top3', []) if isinstance(relationships, dict) else []
-            if top3_relationships:
-                context_parts.append("\n【关键关系】")
-                for i, r in enumerate(top3_relationships, 1):
-                    src = r.get('source_entity', {})
-                    tgt = r.get('target_entity', {})
-                    rel_desc = r.get('description', '')
-                    rel_desc_text = rel_desc if isinstance(rel_desc, str) else str(rel_desc)
-                    context_parts.append(f"\n关系{i}: {src.get('name', '')} → {tgt.get('name', '')}")
-                    context_parts.append(f"关系描述: {rel_desc_text}")  # 完整描述
-                    context_parts.append(f"源实体描述: {src.get('description', '')}")
-                    context_parts.append(f"目标实体描述: {tgt.get('description', '')}")
-        
-        # NormalRAG结果（使用所有topk个句子）
-        if 'normalrag' in search_results and search_results['normalrag']:
-            sentences = search_results['normalrag'].get('sentences', [])
-            if sentences:
-                context_parts.append("\n【相关句子】")
-                for i, s in enumerate(sentences, 1):  # 使用所有topk个句子
-                    context_parts.append(f"\n句子{i}: {s['text']}")
-                    context_parts.append(f"来源: {s.get('doc_name', '')} (文档ID:{s.get('doc_id', '')})")
+            findings = graphrag.get('findings', []) or []
+            capability = graphrag.get('capability', {}) or {}
+            evidence = graphrag.get('evidence', {}) or {}
+            if capability:
+                context_parts.append("\n【GraphRAG 状态】")
+                context_parts.append(
+                    f"mode={capability.get('mode', '')}; degraded={capability.get('is_degraded', False)}; summary={capability.get('summary', '')}"
+                )
+            if evidence:
+                context_parts.append("\n【GraphRAG 证据统计】")
+                context_parts.append(json.dumps(evidence, ensure_ascii=False))
+            if findings:
+                context_parts.append("\n【GraphRAG Finding 主结果】")
+                for i, item in enumerate(findings[:6] if has_expert_evidence else findings, 1):
+                    context_parts.append(f"\nFinding{i}: {item.get('finding_title') or item.get('finding_id') or ''}")
+                    context_parts.append(f"Statement: {item.get('finding_statement') or ''}")
+                    context_parts.append(
+                        f"Scores: final={item.get('score', '')}, graph={item.get('graph_score', '')}, evidence={item.get('evidence_score', '')}"
+                    )
+                    if item.get('topics'):
+                        context_parts.append(f"Topics: {', '.join([str(x) for x in item.get('topics', []) if x])}")
+                    if item.get('events'):
+                        context_parts.append(f"Events: {', '.join([str(x) for x in item.get('events', []) if x])}")
+                    if item.get('claims'):
+                        context_parts.append(f"Claims: {'; '.join([str(x) for x in item.get('claims', []) if x])}")
+                    if item.get('post_titles'):
+                        context_parts.append(f"Posts: {'; '.join([str(x) for x in item.get('post_titles', []) if x])}")
         
         # TagRAG结果
         if 'tagrag' in search_results and search_results['tagrag']:
             text_blocks = search_results['tagrag'].get('text_blocks', [])
             if text_blocks:
                 context_parts.append("\n【相关文本块】")
-                for i, t in enumerate(text_blocks, 1):  # 使用所有topk个文本块
+                capped_blocks = text_blocks[:8] if has_expert_evidence else text_blocks
+                for i, t in enumerate(capped_blocks, 1):
                     context_parts.append(f"\n文本块{i}:")
                     context_parts.append(f"标签: {t.get('text_tag', '')}")
                     context_parts.append(f"完整内容: {t.get('text', '')}")  # 使用完整text
@@ -451,7 +610,10 @@ class AdvancedRAGSearcher:
     
     def _load_tables(self) -> None:
         """加载所有表"""
-        table_names = ["normalrag", "graphrag_entities", "graphrag_relationships", "graphrag_texts"]
+        # GraphRAG 已统一走 Neo4j 业务图谱；这里仅保留
+        # - normalrag: 句子检索
+        # - graphrag_texts: TagRAG 文本块检索
+        table_names = ["normalrag", "graphrag_texts"]
         for name in table_names:
             try:
                 self.tables[name] = self.db.open_table(name)
@@ -477,6 +639,76 @@ class AdvancedRAGSearcher:
             log_error(self.logger, f"无法加载文档时间: {str(e)}", "searcher")
         
         return doc_times
+
+    @staticmethod
+    def _dedup_terms(values: List[Any], max_items: int = 8, max_len: int = 24) -> List[str]:
+        terms: List[str] = []
+        seen = set()
+        for raw in values:
+            token = str(raw or "").strip()
+            if not token or len(token) > max_len:
+                continue
+            key = token.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            terms.append(token)
+            if len(terms) >= max_items:
+                break
+        return terms
+
+    def _build_rewrite_terms(self, retrieval_plan: Dict[str, Any], hints: Dict[str, Any], max_items: int = 8) -> List[str]:
+        candidates: List[Any] = []
+        candidates.extend(retrieval_plan.get("tasks", []) or [])
+        candidates.extend(retrieval_plan.get("methods", []) or [])
+        candidates.extend(retrieval_plan.get("dimensions", []) or [])
+        candidates.extend((hints or {}).get("keywords", []) or [])
+        candidates.extend((hints or {}).get("time_terms", []) or [])
+        return self._dedup_terms(candidates, max_items=max_items)
+
+    @staticmethod
+    def _hint_score(text: str, positive_terms: List[str], negative_terms: List[str]) -> float:
+        if not text:
+            return 0.0
+        score = 0.0
+        for token in positive_terms:
+            if token and token in text:
+                score += 0.08
+        for token in negative_terms:
+            if token and token in text:
+                score -= 0.08
+        if score > 0.30:
+            return 0.30
+        if score < -0.24:
+            return -0.24
+        return score
+
+    def _rerank_items_by_hints(
+        self,
+        items: List[Dict[str, Any]],
+        positive_terms: List[str],
+        negative_terms: List[str],
+        *,
+        text_keys: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not items or (not positive_terms and not negative_terms):
+            return items
+        keys = text_keys or ["text", "description", "name", "source", "target", "text_tag"]
+        scored: List[Tuple[float, int, Dict[str, Any]]] = []
+        for idx, item in enumerate(items):
+            merged_text_parts: List[str] = []
+            for k in keys:
+                val = item.get(k)
+                if isinstance(val, str) and val:
+                    merged_text_parts.append(val)
+            merged_text = "\n".join(merged_text_parts)
+            hint_score = self._hint_score(merged_text, positive_terms, negative_terms)
+            clone = dict(item)
+            if hint_score != 0.0:
+                clone["expert_hint_score"] = round(hint_score, 4)
+            scored.append((hint_score, idx, clone))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [x[2] for x in scored]
     
     async def _process_time_filter(self, query: str) -> TimeRange:
         """处理时间过滤"""
@@ -504,337 +736,16 @@ class AdvancedRAGSearcher:
         log_success(self.logger, f"文档匹配完成: {', '.join(matched_doc_ids)}", "RouterRetrieve")
         
         return TimeRange(has_time=True, time_text=time_text, matched_docs=matched_doc_ids)
-    
-    async def _graphrag_search(self, query_vec: List[float], time_range: TimeRange, topk: int) -> GraphRAGResult:
-        """
-        GraphRAG检索：联合实体向量+描述向量，扩展核心实体的所有关系
-        """
-        
-        entity_table = self.tables.get("graphrag_entities")
-        rel_table = self.tables.get("graphrag_relationships")
-        texts_table = self.tables.get("graphrag_texts")
-        
-        if not entity_table or not rel_table:
-            log_error(self.logger, "表不存在", "graphrag")
-            return GraphRAGResult(entities=[], relationships=[], multi_hop_paths=[])
-        
-        # 加载完整的实体和关系数据
-        entities_df = entity_table.to_pandas()
-        relations_df = rel_table.to_pandas()
-        
-        # 1. 联合检索：实体名称向量 + 实体描述向量（支持时间过滤）
-        try:
-            # 如果有时间过滤，先筛选全库样本
-            if time_range.has_time and time_range.matched_docs:
-                # 1. 从全库中筛选符合时间范围的实体
-                time_filtered_entity_ids = []
-                for _, entity_row in entities_df.iterrows():
-                    doc_ids = json.loads(entity_row.get('doc_ids', '[]'))
-                    if any(doc_id in time_range.matched_docs for doc_id in doc_ids):
-                        time_filtered_entity_ids.append(entity_row['entity_id'])
-                
-                total_entities = len(entities_df)
-                filtered_count = len(time_filtered_entity_ids)
-                
-                
-                # 如果没有符合时间的实体，返回空结果
-                if not time_filtered_entity_ids:
-                    log_error(self.logger, "  未找到符合时间范围的实体", "graphrag")
-                    core_entity_ids = []
-                else:
-                    # 2. 在筛选后的样本上进行向量检索
-                    # 获取全库检索结果
-                    name_results = entity_table.search(query_vec, vector_column_name="entity_name_vec").limit(total_entities).to_list()
-                    desc_results = entity_table.search(query_vec, vector_column_name="description_vec").limit(total_entities).to_list()
-                    
-                    # 只保留符合时间范围的结果
-                    name_results = [e for e in name_results if e['entity_id'] in time_filtered_entity_ids]
-                    desc_results = [e for e in desc_results if e['entity_id'] in time_filtered_entity_ids]
-                                        
-                    # 合并结果并综合排序（保存详细的距离信息）
-                    entity_scores = {}  # entity_id -> {total_score, name_dist, desc_dist}
-                    for e in name_results:
-                        eid = e['entity_id']
-                        if eid not in entity_scores:
-                            entity_scores[eid] = {'name_dist': None, 'desc_dist': None}
-                        entity_scores[eid]['name_dist'] = e.get('_distance', 1.0)
-                    
-                    for e in desc_results:
-                        eid = e['entity_id']
-                        if eid not in entity_scores:
-                            entity_scores[eid] = {'name_dist': None, 'desc_dist': None}
-                        entity_scores[eid]['desc_dist'] = e.get('_distance', 1.0)
-                    
-                    # 计算综合分数（取两者平均，如果只有一个就用一个）
-                    for eid in entity_scores:
-                        name_d = entity_scores[eid]['name_dist']
-                        desc_d = entity_scores[eid]['desc_dist']
-                        if name_d is not None and desc_d is not None:
-                            entity_scores[eid]['total'] = (name_d + desc_d) / 2
-                        elif name_d is not None:
-                            entity_scores[eid]['total'] = name_d
-                        else:
-                            entity_scores[eid]['total'] = desc_d
-                    
-                    # 按综合分数排序（距离越小越相似）
-                    sorted_items = sorted(entity_scores.items(), key=lambda x: x[1]['total'])
-                    core_entity_ids = [item[0] for item in sorted_items[:topk]]
-                    
-                    # 输出详细日志
-                    for i, (eid, scores) in enumerate(sorted_items[:topk], 1):
-                        entity_name = entities_df[entities_df['entity_id'] == eid].iloc[0]['entity_name']
-            else:
-                # 无时间过滤，正常检索
-                name_results = entity_table.search(query_vec, vector_column_name="entity_name_vec").limit(topk * 2).to_list()
-                desc_results = entity_table.search(query_vec, vector_column_name="description_vec").limit(topk * 2).to_list()
-                
-                # 合并结果并综合排序（保存详细的距离信息）
-                entity_scores = {}  # entity_id -> {total_score, name_dist, desc_dist}
-                for e in name_results:
-                    eid = e['entity_id']
-                    if eid not in entity_scores:
-                        entity_scores[eid] = {'name_dist': None, 'desc_dist': None}
-                    entity_scores[eid]['name_dist'] = e.get('_distance', 1.0)
-                
-                for e in desc_results:
-                    eid = e['entity_id']
-                    if eid not in entity_scores:
-                        entity_scores[eid] = {'name_dist': None, 'desc_dist': None}
-                    entity_scores[eid]['desc_dist'] = e.get('_distance', 1.0)
-                
-                # 计算综合分数（取两者平均，如果只有一个就用一个）
-                for eid in entity_scores:
-                    name_d = entity_scores[eid]['name_dist']
-                    desc_d = entity_scores[eid]['desc_dist']
-                    if name_d is not None and desc_d is not None:
-                        entity_scores[eid]['total'] = (name_d + desc_d) / 2
-                    elif name_d is not None:
-                        entity_scores[eid]['total'] = name_d
-                    else:
-                        entity_scores[eid]['total'] = desc_d
-                
-                # 按综合分数排序（距离越小越相似）
-                sorted_items = sorted(entity_scores.items(), key=lambda x: x[1]['total'])
-                core_entity_ids = [item[0] for item in sorted_items[:topk]]
-                
-                # 输出详细日志
-                for i, (eid, scores) in enumerate(sorted_items[:topk], 1):
-                    entity_name = entities_df[entities_df['entity_id'] == eid].iloc[0]['entity_name']
-            
-        except Exception as e:
-            log_error(self.logger, f"[entity_search] 失败: {str(e)}", "graphrag")
-            core_entity_ids = []
-        
-        # 2. 扩展核心实体：查找所有相关实体和关系
-        expanded_entities = {}  # entity_id -> entity_info
-        expanded_relationships = []  # list of relationship_info
-        
-        try:
-            for core_id in core_entity_ids:
-                # 添加核心实体
-                core_entity = entities_df[entities_df['entity_id'] == core_id].iloc[0]
-                expanded_entities[core_id] = core_entity
-                
-                # 查找所有相关关系
-                related_rels = relations_df[
-                    (relations_df['source'] == core_id) | 
-                    (relations_df['target'] == core_id)
-                ]
-                
-                for _, rel in related_rels.iterrows():
-                    src_id = rel['source']
-                    tgt_id = rel['target']
-                    
-                    # 添加关系
-                    expanded_relationships.append(rel)
-                    
-                    # 添加相关实体
-                    if src_id not in expanded_entities:
-                        src_entity = entities_df[entities_df['entity_id'] == src_id]
-                        if not src_entity.empty:
-                            expanded_entities[src_id] = src_entity.iloc[0]
-                    
-                    if tgt_id not in expanded_entities:
-                        tgt_entity = entities_df[entities_df['entity_id'] == tgt_id]
-                        if not tgt_entity.empty:
-                            expanded_entities[tgt_id] = tgt_entity.iloc[0]
-            
-        except Exception as e:
-            log_error(self.logger, f"[entity_expand] 失败: {str(e)}", "graphrag")
-        
-        # 3. 检索关系Top3，并获取对应的两个实体
-        top_relations = []
-        try:
-            # 如果有时间过滤，先筛选全库样本
-            if time_range.has_time and time_range.matched_docs:
-                # 1. 从全库中筛选符合时间范围的关系
-                time_filtered_rel_ids = []
-                for _, rel_row in relations_df.iterrows():
-                    try:
-                        doc_ids = json.loads(rel_row.get('doc_ids', '[]'))
-                        if any(doc_id in time_range.matched_docs for doc_id in doc_ids):
-                            time_filtered_rel_ids.append(rel_row['relationship_id'])
-                    except:
-                        continue
-                
-                total_relations = len(relations_df)
-                filtered_count = len(time_filtered_rel_ids)
-                
-                
-                if filtered_count == 0:
-                    log_error(self.logger, "  未找到符合时间范围的关系", "graphrag")
-                    rel_results = []
-                else:
-                    # 2. 在筛选后的样本上进行向量检索
-                    # 获取全库检索结果
-                    all_rel_results = rel_table.search(query_vec, vector_column_name="description_vec").limit(total_relations).to_list()
-                    
-                    # 只保留符合时间范围的结果
-                    rel_results = [r for r in all_rel_results if r['relationship_id'] in time_filtered_rel_ids]
-                    
-            else:
-                # 无时间过滤，正常检索
-                rel_results = rel_table.search(query_vec, vector_column_name="description_vec").limit(10).to_list()
-            
-            # 按距离重新排序（确保距离小的在前面）
-            rel_results = sorted(rel_results, key=lambda x: x.get('_distance', 1.0))
-            
-            # 获取前3个关系及对应的两个实体
-            for i, r in enumerate(rel_results[:3], 1):
-                src_id = r['source']
-                tgt_id = r['target']
-                
-                # 获取源实体和目标实体
-                src_entity = entities_df[entities_df['entity_id'] == src_id]
-                tgt_entity = entities_df[entities_df['entity_id'] == tgt_id]
-                
-                if not src_entity.empty and not tgt_entity.empty:
-                    src_name = src_entity.iloc[0]['entity_name']
-                    tgt_name = tgt_entity.iloc[0]['entity_name']
-                    distance = r.get('_distance', 1.0)
-                    
-                    top_relations.append({
-                        'relation': r,
-                        'source_entity': src_entity.iloc[0],
-                        'target_entity': tgt_entity.iloc[0]
-                    })
 
-        except Exception as e:
-            log_error(self.logger, f"[relation_search] 失败: {str(e)}", "graphrag")
-        
-        # 4. 整理实体和关系的详细信息
-        try:
-            # 统计信息
-            total_core_entities = len(core_entity_ids)
-            total_expanded_entities = len([e for e in expanded_entities.keys() if e not in core_entity_ids])
-            total_relations = len(expanded_relationships)
-            
-            
-            # 输出核心实体的详细信息
-            for i, eid in enumerate(core_entity_ids[:5], 1):
-                if eid in expanded_entities:
-                    e = expanded_entities[eid]
-                    desc = e['description']
-                    desc_text = desc if isinstance(desc, str) else str(desc)
-            
-            # 输出关键关系的详细信息
-            for i, rel in enumerate(expanded_relationships[:5], 1):
-                src_id = rel['source']
-                tgt_id = rel['target']
-                if src_id in expanded_entities and tgt_id in expanded_entities:
-                    src_name = expanded_entities[src_id]['entity_name']
-                    tgt_name = expanded_entities[tgt_id]['entity_name']
-                    rel_desc = rel['description']
-                    rel_desc_text = rel_desc if isinstance(rel_desc, str) else str(rel_desc)
-        except Exception as e:
-            log_error(self.logger, f"[info_summary] 失败: {str(e)}", "graphrag")
-        
-        # 格式化结果
-        entities = []
-        for entity_id in core_entity_ids:
-            if entity_id in expanded_entities:
-                e = expanded_entities[entity_id]
-                entities.append({
-                    "entity_id": e['entity_id'],
-                    "name": e['entity_name'],
-                    "type": e['type'],
-                    "description": e['description'],
-                    "doc_ids": json.loads(e.get('doc_ids', '[]')),
-                    "text_ids": json.loads(e.get('text_ids', '[]'))
-                })
-        
-        # 扩展的实体（非核心）
-        extended_entities = []
-        for entity_id, e in expanded_entities.items():
-            if entity_id not in core_entity_ids:
-                extended_entities.append({
-                    "entity_id": e['entity_id'],
-                    "name": e['entity_name'],
-                    "type": e['type'],
-                    "description": e['description'],
-                    "doc_ids": json.loads(e.get('doc_ids', '[]')),
-                    "text_ids": json.loads(e.get('text_ids', '[]'))
-                })
-        
-        # 关系
-        relationships = []
-        for r in expanded_relationships:
-            relationships.append({
-                "relationship_id": r['relationship_id'],
-                "source": r['source'],
-                "target": r['target'],
-                "description": r['description'],
-                "doc_ids": json.loads(r.get('doc_ids', '[]')),
-                "text_ids": json.loads(r.get('text_ids', '[]'))
-            })
-        
-        # Top3关系（含对应实体）
-        top3_relations = []
-        for item in top_relations:
-            r = item['relation']
-            src = item['source_entity']
-            tgt = item['target_entity']
-            top3_relations.append({
-                "relationship_id": r['relationship_id'],
-                "source_entity": {
-                    "entity_id": src['entity_id'],
-                    "name": src['entity_name'],
-                    "type": src['type'],
-                    "description": src['description']
-                },
-                "target_entity": {
-                    "entity_id": tgt['entity_id'],
-                    "name": tgt['entity_name'],
-                    "type": tgt['type'],
-                    "description": tgt['description']
-                },
-                "description": r['description'],
-                "doc_ids": json.loads(r.get('doc_ids', '[]')),
-                "score": round(r.get('_distance', 0.0), 4)
-            })
-        
-        # 构建知识图谱摘要（用于LLM整理）
-        graph_summary = {
-            "core_entities_count": len(entities),
-            "extended_entities_count": len(extended_entities),
-            "total_relationships": len(relationships),
-            "top3_relationships": len(top3_relations)
-        }
-        
-        # 打印召回统计
-        log_success(self.logger, f"[GraphRAG]召回: 实体数-{len(entities) + len(extended_entities)} | 关系数-{len(relationships)}", "RouterRetrieve")
-        
-        return GraphRAGResult(
-            entities={
-                "core": entities,
-                "extended": extended_entities
-            },
-            relationships={
-                "all": relationships,
-                "top3": top3_relations
-            },
-            multi_hop_paths=graph_summary
-        )
+    def _has_tagrag_table(self) -> bool:
+        return bool(self.tables.get("graphrag_texts"))
+
+    def _build_neo4j_graphrag(self, hits: List[Dict[str, Any]], topk: int) -> Dict[str, Any]:
+        """将 Neo4j finding-centric 命中统一映射为 graphrag 输出结构。"""
+        return GraphRAGFormatter().format(hits, topk)
+
+    def _search_opinion_graph(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        return GraphRAGRetriever().retrieve(query, top_k)
     
     async def _normalrag_search(self, query_vec: List[float], time_range: TimeRange, 
                                 topk: int) -> NormalRAGResult:
@@ -963,19 +874,70 @@ class AdvancedRAGSearcher:
     
     async def search(self, params: SearchParams) -> Dict[str, Any]:
         """主检索函数"""
-        
-        # 步骤0: 查询扩展/重写（提升检索准确率，可选）
         original_query = params.query_text
+        retrieval_plan: Dict[str, Any] = {}
+        plan_trace: Dict[str, Any] = {}
+        expert_guidance = ""
+        expert_results: List[Dict[str, Any]] = []
+        opinion_graph_hits: List[Dict[str, Any]] = []
+        retrieval_hints = {"keywords": [], "exclude": [], "time_terms": []}
+        expert_overlay = {"enabled": params.enable_expert_overlay, "status": "disabled", "error": ""}
+
+        # 步骤0: Expert Overlay（非阻断）
+        if params.enable_expert_overlay:
+            try:
+                from src.rag.retrievers.expert_retriever import ExpertRetriever
+
+                expert_retriever = ExpertRetriever()
+                # ExpertRetriever internally uses sync planner logic; run it in a worker
+                # thread to avoid nested event-loop errors inside async search().
+                expert_payload = await asyncio.to_thread(
+                    expert_retriever.retrieve_guidance_payload,
+                    original_query,
+                )
+                retrieval_plan = expert_payload.get("retrieval_plan") or {}
+                plan_trace = expert_payload.get("plan_trace") or {}
+                expert_guidance = str(expert_payload.get("expert_guidance") or "")
+                expert_results = expert_payload.get("expert_results") or []
+                retrieval_hints = retrieval_plan.get("retrieval_hints") or {"keywords": [], "exclude": [], "time_terms": []}
+                retrieval_hints = {
+                    "keywords": self._dedup_terms(retrieval_hints.get("keywords", []), max_items=20, max_len=24),
+                    "exclude": self._dedup_terms(retrieval_hints.get("exclude", []), max_items=20, max_len=24),
+                    "time_terms": self._dedup_terms(retrieval_hints.get("time_terms", []), max_items=20, max_len=24),
+                }
+                expert_overlay["status"] = "ok"
+            except Exception as e:
+                expert_overlay["status"] = "degraded"
+                expert_overlay["error"] = str(e)
+                log_error(self.logger, f"Expert overlay降级: {e}", "RouterRetrieve")
+
+        # 步骤0.3: opinion业务图谱检索（独立于expert图谱，非阻断）
+        opinion_graph_hits: List[Dict[str, Any]] = []
+        try:
+            opinion_graph_hits = await asyncio.to_thread(
+                self._search_opinion_graph, original_query, params.topk_graphrag
+            )
+        except Exception as e:
+            log_error(self.logger, f"Opinion图谱检索降级: {e}", "RouterRetrieve")
+
+        # 步骤0.1: Expert Query Rewrite（追加，不替换）
+        rewrite_terms: List[str] = []
+        rewritten_query = original_query
+        if params.enable_expert_overlay and params.enable_expert_rewrite:
+            rewrite_terms = self._build_rewrite_terms(retrieval_plan, retrieval_hints, max_items=8)
+            if rewrite_terms:
+                rewritten_query = f"{original_query} {' '.join(rewrite_terms)}"
+                log_success(self.logger, f"Expert Rewrite追加词: {', '.join(rewrite_terms)}", "RouterRetrieve")
+
+        # 步骤0.2: 原有查询扩展（可选）
         if params.enable_query_expansion:
-            expanded_query = await self.llm_helper.expand_query(original_query)
-            # 使用扩展后的查询进行后续检索
-            # 但保留原始查询用于结果展示和时间过滤（时间过滤使用原始查询更准确）
-            effective_query = expanded_query if expanded_query != original_query else original_query
-            if effective_query != original_query:
-                log_success(self.logger, f"查询已扩展: {original_query[:50]}... -> {effective_query[:50]}...", "RouterRetrieve")
+            expanded_query = await self.llm_helper.expand_query(rewritten_query)
+            effective_query = expanded_query if expanded_query != rewritten_query else rewritten_query
+            if effective_query != rewritten_query:
+                log_success(self.logger, f"查询已扩展: {rewritten_query[:50]}... -> {effective_query[:50]}...", "RouterRetrieve")
         else:
-            effective_query = original_query
-            log_success(self.logger, f"查询扩展已禁用，使用原始查询", "RouterRetrieve")
+            effective_query = rewritten_query
+            log_success(self.logger, "查询扩展已禁用", "RouterRetrieve")
         
         # 步骤1: 时间过滤（使用原始查询，因为时间信息提取更准确）
         time_range = await self._process_time_filter(original_query)
@@ -992,6 +954,30 @@ class AdvancedRAGSearcher:
             "query_text": original_query,  # 保留原始查询用于展示
             "expanded_query": effective_query if effective_query != original_query else None,  # 扩展后的查询
             "search_mode": params.search_mode,
+            "expert_overlay": expert_overlay,
+            "query_rewrite": {
+                "original": original_query,
+                "effective": effective_query,
+                "added_terms": rewrite_terms,
+            },
+            "retrieval_hints_used": retrieval_hints,
+            "retrieval_plan": retrieval_plan,
+            "plan_trace": plan_trace,
+            "expert_guidance": expert_guidance,
+            "neo4jrag": {
+                "expert_nodes": expert_results,
+            },
+            "opinion_graph": {
+                "hits": opinion_graph_hits,
+            },
+            "answer_structure": {
+                "template": "Task -> Method -> Evidence -> Conclusion/Gap",
+                "applied": bool(
+                    params.enable_expert_overlay
+                    and params.enable_expert_answer_structure
+                    and retrieval_plan
+                ),
+            },
             "time_filter": {
                 "has_time": time_range.has_time,
                 "time_text": time_range.time_text,
@@ -1000,34 +986,27 @@ class AdvancedRAGSearcher:
         }
         
         if params.search_mode == "mixed":
-            
-            graphrag_result, normalrag_result, tagrag_result = await asyncio.gather(
-                self._graphrag_search(query_vec, time_range, params.topk_graphrag),
-                self._normalrag_search(query_vec, time_range, params.topk_normalrag),
-                self._tagrag_search(query_vec, time_range, params.topk_tagrag)
-            )
-            
-            results["graphrag"] = {
-                "entities": graphrag_result.entities,
-                "relationships": graphrag_result.relationships,
-                "summary": graphrag_result.multi_hop_paths
-            }
+            # 统一口径：GraphRAG仅使用 Neo4j 图检索结果。
+            results["graphrag"] = self._build_neo4j_graphrag(opinion_graph_hits, params.topk_graphrag)
+            if self._has_tagrag_table():
+                normalrag_result, tagrag_result = await asyncio.gather(
+                    self._normalrag_search(query_vec, time_range, params.topk_normalrag),
+                    self._tagrag_search(query_vec, time_range, params.topk_tagrag)
+                )
+                tag_blocks = tagrag_result.text_blocks
+            else:
+                normalrag_result = await self._normalrag_search(query_vec, time_range, params.topk_normalrag)
+                tag_blocks = []
             results["normalrag"] = {
                 "sentences": normalrag_result.sentences
             }
             results["tagrag"] = {
-                "text_blocks": tagrag_result.text_blocks
+                "text_blocks": tag_blocks
             }
         
         elif params.search_mode == "graphrag":
-            graphrag_result = await self._graphrag_search(
-                query_vec, time_range, params.topk_graphrag
-            )
-            results["graphrag"] = {
-                "entities": graphrag_result.entities,
-                "relationships": graphrag_result.relationships,
-                "summary": graphrag_result.multi_hop_paths
-            }
+            # 统一口径：GraphRAG仅使用 Neo4j 图检索结果。
+            results["graphrag"] = self._build_neo4j_graphrag(opinion_graph_hits, params.topk_graphrag)
         
         elif params.search_mode == "normalrag":
             normalrag_result = await self._normalrag_search(query_vec, time_range, params.topk_normalrag)
@@ -1036,10 +1015,64 @@ class AdvancedRAGSearcher:
             }
         
         elif params.search_mode == "tagrag":
-            tagrag_result = await self._tagrag_search(query_vec, time_range, params.topk_tagrag)
+            if self._has_tagrag_table():
+                tagrag_result = await self._tagrag_search(query_vec, time_range, params.topk_tagrag)
+                tag_blocks = tagrag_result.text_blocks
+            else:
+                log_success(self.logger, "TagRAG未启用（缺少graphrag_texts表）", "RouterRetrieve")
+                tag_blocks = []
             results["tagrag"] = {
-                "text_blocks": tagrag_result.text_blocks
+                "text_blocks": tag_blocks
             }
+
+        # 步骤3.1: Retrieval hints 轻量重排（仅内存排序，不改底层索引）
+        if params.enable_expert_overlay and params.enable_expert_hints:
+            positive_terms = self._dedup_terms(
+                (retrieval_plan.get("tasks", []) or [])
+                + (retrieval_plan.get("methods", []) or [])
+                + (retrieval_hints.get("keywords", []) or []),
+                max_items=32,
+                max_len=24,
+            )
+            negative_terms = self._dedup_terms(
+                retrieval_hints.get("exclude", []) or [],
+                max_items=16,
+                max_len=24,
+            )
+            if positive_terms or negative_terms:
+                if "normalrag" in results and isinstance(results["normalrag"], dict):
+                    sent = results["normalrag"].get("sentences", []) or []
+                    results["normalrag"]["sentences"] = self._rerank_items_by_hints(
+                        sent,
+                        positive_terms,
+                        negative_terms,
+                        text_keys=["text", "doc_name"],
+                    )
+                if "tagrag" in results and isinstance(results["tagrag"], dict):
+                    blocks = results["tagrag"].get("text_blocks", []) or []
+                    results["tagrag"]["text_blocks"] = self._rerank_items_by_hints(
+                        blocks,
+                        positive_terms,
+                        negative_terms,
+                        text_keys=["text", "text_tag", "doc_name"],
+                    )
+                if "graphrag" in results and isinstance(results["graphrag"], dict):
+                    findings = results["graphrag"].get("findings", []) or []
+                    results["graphrag"]["findings"] = self._rerank_items_by_hints(
+                        findings,
+                        positive_terms,
+                        negative_terms,
+                        text_keys=[
+                            "finding_title",
+                            "finding_statement",
+                            "topics",
+                            "platforms",
+                            "events",
+                            "claims",
+                            "post_titles",
+                            "recommendations",
+                        ],
+                    )
                 
         # 步骤4: 使用LLM整理检索结果（可选）
         if params.enable_llm_summary:
@@ -1091,6 +1124,14 @@ def router_retrieve(
     enable_llm_summary: bool = True,
     llm_summary_mode: str = "strict",
     return_format: str = "both",
+    enable_expert_overlay: bool = True,
+    enable_expert_rewrite: bool = True,
+    enable_expert_hints: bool = True,
+    enable_expert_answer_structure: bool = True,
+    question_type: Optional[str] = None,
+    experiment_tag: str = "default",
+    trace_id: Optional[str] = None,
+    use_question_preset: bool = True,
     db_base_path: Optional[Path] = None
 ) -> Dict[str, Any]:
     """
@@ -1127,6 +1168,26 @@ def router_retrieve(
         
         # 创建QwenClient
         qwen_client = QwenClient()
+
+        resolved_question_type = (question_type or "").strip().lower() or detect_question_type(query)
+        if resolved_question_type not in QUESTION_TYPE_PRESETS:
+            resolved_question_type = "explore"
+        preset = QUESTION_TYPE_PRESETS.get(resolved_question_type, {})
+        applied_preset: Dict[str, Any] = {}
+
+        if use_question_preset and preset:
+            mode = str(preset.get("mode", mode))
+            topk_graphrag = int(preset.get("topk_graphrag", topk_graphrag))
+            topk_normalrag = int(preset.get("topk_normalrag", topk_normalrag))
+            topk_tagrag = int(preset.get("topk_tagrag", topk_tagrag))
+            llm_summary_mode = str(preset.get("llm_summary_mode", llm_summary_mode))
+            enable_expert_overlay = bool(preset.get("enable_expert_overlay", enable_expert_overlay))
+            enable_expert_rewrite = bool(preset.get("enable_expert_rewrite", enable_expert_rewrite))
+            enable_expert_hints = bool(preset.get("enable_expert_hints", enable_expert_hints))
+            enable_expert_answer_structure = bool(
+                preset.get("enable_expert_answer_structure", enable_expert_answer_structure)
+            )
+            applied_preset = dict(preset)
         
         # 提示词文件由topic自动确定
         prompts_file = f"{topic}.yaml"
@@ -1153,12 +1214,23 @@ def router_retrieve(
             enable_query_expansion=enable_query_expansion,
             enable_llm_summary=enable_llm_summary,
             llm_summary_mode=llm_summary_mode,
-            return_format=return_format
+            return_format=return_format,
+            enable_expert_overlay=enable_expert_overlay,
+            enable_expert_rewrite=enable_expert_rewrite,
+            enable_expert_hints=enable_expert_hints,
+            enable_expert_answer_structure=enable_expert_answer_structure,
         )
         
         
         # 执行检索（需要使用asyncio运行）
         results = asyncio.run(searcher.search(params))
+        if isinstance(results, dict):
+            results["question_type"] = resolved_question_type
+            results["experiment_tag"] = str(experiment_tag or "default")
+            results["trace_id"] = trace_id or uuid.uuid4().hex
+            results["preset_applied"] = bool(use_question_preset and applied_preset)
+            if applied_preset:
+                results["preset_config"] = applied_preset
         
         return results
         
@@ -1177,6 +1249,14 @@ def retrieve_documents(
     top_k: int = 10,
     threshold: float = 0.0,
     mode: str = "normalrag",
+    enable_expert_overlay: bool = True,
+    enable_expert_rewrite: bool = True,
+    enable_expert_hints: bool = True,
+    enable_expert_answer_structure: bool = True,
+    question_type: Optional[str] = None,
+    experiment_tag: str = "default",
+    trace_id: Optional[str] = None,
+    use_question_preset: bool = True,
     db_base_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
@@ -1185,11 +1265,11 @@ def retrieve_documents(
     """
     # 获取全局RAG配置中的功能开关
     from ...setting.settings import settings
-    rag_config = settings.get_config("rag") or {}
+    rag_config = settings.get("rag", {}) or {}
     retrieval_config = rag_config.get("retrieval", {})
     
     enable_qe = retrieval_config.get("enable_query_expansion", True)
-    enable_sum = retrieval_config.get("enable_llm_summary", False)
+    enable_sum = retrieval_config.get("enable_llm_summary", True)
     sum_mode = retrieval_config.get("llm_summary_mode", "strict")
 
     payload = router_retrieve(
@@ -1202,6 +1282,14 @@ def retrieve_documents(
         enable_llm_summary=enable_sum,
         llm_summary_mode=sum_mode,
         return_format="both",
+        enable_expert_overlay=enable_expert_overlay,
+        enable_expert_rewrite=enable_expert_rewrite,
+        enable_expert_hints=enable_expert_hints,
+        enable_expert_answer_structure=enable_expert_answer_structure,
+        question_type=question_type,
+        experiment_tag=experiment_tag,
+        trace_id=trace_id,
+        use_question_preset=use_question_preset,
         db_base_path=db_base_path,
     )
 
@@ -1210,9 +1298,24 @@ def retrieve_documents(
 
     results: List[Dict[str, Any]] = []
     summary = payload.get("llm_summary", "")
+    debug_fields = {
+        "trace_id": payload.get("trace_id", ""),
+        "experiment_tag": payload.get("experiment_tag", "default"),
+        "question_type": payload.get("question_type", question_type or ""),
+        "preset_applied": payload.get("preset_applied", False),
+        "preset_config": payload.get("preset_config", {}),
+        "expert_overlay": payload.get("expert_overlay", {}),
+        "query_rewrite": payload.get("query_rewrite", {}),
+        "retrieval_hints_used": payload.get("retrieval_hints_used", {}),
+        "retrieval_plan": payload.get("retrieval_plan", {}),
+        "plan_trace": payload.get("plan_trace", {}),
+        "answer_structure": payload.get("answer_structure", {}),
+        "expert_guidance": payload.get("expert_guidance", ""),
+    }
 
     if mode == "tagrag":
         items = payload.get("tagrag", {}).get("text_blocks", [])
+        raw_total = len(items)
         for item in items:
             distance = float(item.get("score", 1.0))
             similarity = max(0.0, 1.0 - distance)
@@ -1228,56 +1331,88 @@ def retrieve_documents(
                     "text_tag": item.get("text_tag"),
                 },
             })
-        return {"results": results, "total": len(results), "summary": summary}
+        return {"results": results, "total": len(results), "raw_total": raw_total, "summary": summary, **debug_fields}
 
     elif mode == "graphrag" or mode == "mixed":
         graphrag_data = payload.get("graphrag", {})
-        
-        # 1. Extract Entities
-        entities = graphrag_data.get("entities", [])
-        if isinstance(entities, dict):
-            entities = entities.get("core", []) + entities.get("extended", [])
-            
-        for item in entities:
-            text = f"【实体】{item.get('name')} ({item.get('type')})\n{item.get('description')}"
+
+        findings = graphrag_data.get("findings", []) or []
+        capability = graphrag_data.get("capability", {}) or {}
+        evidence = graphrag_data.get("evidence", {}) or {}
+
+        for item in findings:
+            text_parts = [
+                f"【Finding】{item.get('finding_title') or item.get('finding_id') or ''}",
+                str(item.get("finding_statement") or "").strip(),
+            ]
+            if item.get("topics"):
+                text_parts.append("Topics: " + ", ".join([str(x) for x in item.get("topics", []) if x]))
+            if item.get("platforms"):
+                text_parts.append("Platforms: " + ", ".join([str(x) for x in item.get("platforms", []) if x]))
+            if item.get("events"):
+                text_parts.append("Events: " + ", ".join([str(x) for x in item.get("events", []) if x]))
+            if item.get("claims"):
+                text_parts.append("Claims: " + "; ".join([str(x) for x in item.get("claims", []) if x]))
+            if item.get("post_titles"):
+                text_parts.append("Posts: " + "; ".join([str(x) for x in item.get("post_titles", []) if x]))
+            if item.get("recommendations"):
+                text_parts.append("Recommendations: " + "; ".join([str(x) for x in item.get("recommendations", []) if x]))
+            related = item.get("related_findings") or []
+            if related:
+                text_parts.append(
+                    "Related: " + "; ".join(
+                        [str(x.get("finding_title") or x.get("finding_id") or "") for x in related if isinstance(x, dict)]
+                    )
+                )
+
+            finding_score = float(item.get("score", 0.0) or 0.0)
             results.append({
-                "id": item.get("entity_id") or item.get("name"),
-                "text": text,
-                "score": 0.95,
+                "id": item.get("finding_id") or item.get("finding_title"),
+                "text": "\n".join([part for part in text_parts if part]),
+                "score": round(finding_score, 4),
                 "metadata": {
-                    "type": "entity",
-                    "entity_type": item.get("type"),
-                    "name": item.get("name")
+                    "type": "finding",
+                    "topics": item.get("topics", []) or [],
+                    "platforms": item.get("platforms", []) or [],
+                    "events": item.get("events", []) or [],
+                    "claim_ids": item.get("claim_ids", []) or [],
+                    "chunk_ids": item.get("chunk_ids", []) or [],
+                    "post_ids": item.get("post_ids", []) or [],
+                    "recommendations": item.get("recommendations", []) or [],
+                    "seed": item.get("seed", {}) or {},
+                    "graph_score": item.get("graph_score"),
+                    "evidence_score": item.get("evidence_score"),
                 },
             })
 
-        # 2. Extract Relationships
-        relationships = graphrag_data.get("relationships", [])
-        if isinstance(relationships, dict):
-             relationships = relationships.get("top3", []) + relationships.get("others", [])
-
-        for item in relationships:
-            src = item.get("source_entity", {}).get("name") or item.get("source")
-            tgt = item.get("target_entity", {}).get("name") or item.get("target")
-            desc = item.get("description", "")
-            
-            text = f"【关系】{src} -> {tgt}\n{desc}"
+        if capability:
             results.append({
-                "id": item.get("relationship_id") or f"{src}_{tgt}",
-                "text": text,
-                "score": 0.90,
+                "id": "graphrag_capability",
+                "text": f"【GraphRAG状态】mode={capability.get('mode', '')}; degraded={capability.get('is_degraded', False)}; summary={capability.get('summary', '')}",
+                "score": 1.0,
                 "metadata": {
-                    "type": "relationship",
-                    "source": src,
-                    "target": tgt
+                    "type": "graphrag_capability",
+                    **capability,
                 },
             })
-            
+
+        if evidence:
+            results.append({
+                "id": "graphrag_evidence",
+                "text": "【GraphRAG证据统计】" + json.dumps(evidence, ensure_ascii=False),
+                "score": 0.99,
+                "metadata": {
+                    "type": "graphrag_evidence",
+                    **evidence,
+                },
+            })
+
         if mode == "graphrag":
-            return {"results": results, "total": len(results), "summary": summary}
+            return {"results": results, "total": len(results), "raw_total": len(findings), "summary": summary, **debug_fields}
 
     # Default: normalrag (or mixed part 2)
     items = payload.get("normalrag", {}).get("sentences", [])
+    raw_total = len(items)
     for item in items:
         distance = float(item.get("score", 1.0))
         similarity = max(0.0, 1.0 - distance)
@@ -1293,4 +1428,4 @@ def retrieve_documents(
             },
         })
 
-    return {"results": results, "total": len(results), "summary": summary}
+    return {"results": results, "total": len(results), "raw_total": raw_total, "summary": summary, **debug_fields}

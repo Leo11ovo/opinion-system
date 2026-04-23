@@ -384,6 +384,15 @@ export const routes = [
     }
   },
   {
+    path: '/retrieval/graphrag-lab',
+    name: 'data-retrieval-graphrag-lab',
+    component: () => import('../views/retrieval/GraphRAGLabView.vue'),
+    meta: {
+      title: 'GraphRAG 测试台',
+      breadcrumb: 'GraphRAG 测试台'
+    }
+  },
+  {
     path: '/retrieval/routerrag/graph',
     name: 'data-retrieval-routerrag-graph',
     component: PlaceholderModuleView,

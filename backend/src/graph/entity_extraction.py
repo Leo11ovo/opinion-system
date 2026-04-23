@@ -97,23 +97,25 @@ def extract_entities_naive(text: str) -> List[Tuple[str, str]]:
     return []
 
 
-def _write_entities(
+def _write_entities_for_chunk(
     topic: str,
     channel: str,
     post_id_raw: str,
+    chunk_index: int,
     entities: List[Tuple[str, str]],
 ) -> int:
     """
-    Internal helper to write entities to Neo4j.
+    Internal helper to write entities to Neo4j for a specific Chunk.
+    Writes: (Chunk)-[:MENTIONS]->(Entity) AND (Post)-[:MENTIONS]->(Entity) (Aggregated)
     """
     if not entities:
         return 0
     
     post_global_id = _post_global_id(topic, channel, str(post_id_raw).strip())
+    chunk_id = f"{post_global_id}_chunk_{chunk_index}"
     seen: set = set()
     
     with get_session() as session:
-        # 使用 Transaction 处理一批实体，减少死锁概率
         with session.begin_transaction() as tx:
             for name, etype in entities:
                 if not name or not str(name).strip():
@@ -134,7 +136,17 @@ def _write_entities(
                     """,
                     {"id": entity_id, "name": name, "type": etype, "topic": topic},
                 )
-                # MERGE Relationship
+                
+                # 1. Chunk -> Entity
+                tx.run(
+                    """
+                    MATCH (c:Chunk {id: $cid}), (e:Entity {id: $eid})
+                    MERGE (c)-[:MENTIONS]->(e)
+                    """,
+                    {"cid": chunk_id, "eid": entity_id},
+                )
+                
+                # 2. Post -> Entity (Aggregation for compatibility)
                 tx.run(
                     """
                     MATCH (p:Post {id: $pid}), (e:Entity {id: $eid})
@@ -144,38 +156,22 @@ def _write_entities(
                 )
     return len(seen)
 
-
-def write_entities_for_post(
+def _write_claims_for_chunk(
     topic: str,
     channel: str,
     post_id_raw: str,
-    contents: str,
-    *,
-    extract_fn: Optional[Any] = None,
-) -> int:
-    """
-    从 Post.contents 抽取实体，MERGE Entity 节点并建立 (Post)-[:MENTIONS]->(Entity)。
-    extract_fn(text) -> [(name, type), ...]；默认使用 extract_entities_naive（占位）。
-    返回写入的 MENTIONS 数量。
-    """
-    fn = extract_fn or extract_entities_naive
-    entities = fn(str(contents or ""))
-    return _write_entities(topic, channel, post_id_raw, entities)
-
-
-def write_claims_for_post(
-    topic: str,
-    channel: str,
-    post_id_raw: str,
+    chunk_index: int,
     claims: List[str],
 ) -> int:
     """
-    将提取的观点写入 Neo4j，建立 (Post)-[:HAS_CLAIM]->(Claim)。
+    Internal helper to write claims to Neo4j for a specific Chunk.
+    Writes: (Chunk)-[:HAS_CLAIM]->(Claim) AND (Post)-[:HAS_CLAIM]->(Claim) (Aggregated)
     """
     if not claims:
         return 0
 
     post_global_id = _post_global_id(topic, channel, str(post_id_raw).strip())
+    chunk_id = f"{post_global_id}_chunk_{chunk_index}"
     count = 0
     
     with get_session() as session:
@@ -184,12 +180,12 @@ def write_claims_for_post(
                 if not claim_text or not str(claim_text).strip():
                     continue
                 
-                # 使用简单的 hash 作为 ID，或者 topic + hash
                 import hashlib
                 claim_hash = hashlib.md5(claim_text.encode("utf-8")).hexdigest()
                 claim_id = f"{topic}_claim_{claim_hash}"
                 
                 try:
+                    # MERGE Claim
                     tx.run(
                         """
                         MERGE (c:Claim {id: $id})
@@ -197,18 +193,61 @@ def write_claims_for_post(
                         """,
                         {"id": claim_id, "content": claim_text, "topic": topic}
                     )
+                    
+                    # 1. Chunk -> Claim
                     tx.run(
                         """
-                        MATCH (p:Post {id: $pid}), (c:Claim {id: $cid})
-                        MERGE (p)-[:HAS_CLAIM]->(c)
+                        MATCH (c:Chunk {id: $cid}), (cl:Claim {id: $clid})
+                        MERGE (c)-[:HAS_CLAIM]->(cl)
                         """,
-                        {"pid": post_global_id, "cid": claim_id}
+                        {"cid": chunk_id, "clid": claim_id}
+                    )
+                    
+                    # 2. Post -> Claim (Aggregation)
+                    tx.run(
+                        """
+                        MATCH (p:Post {id: $pid}), (cl:Claim {id: $clid})
+                        MERGE (p)-[:HAS_CLAIM]->(cl)
+                        """,
+                        {"pid": post_global_id, "clid": claim_id}
                     )
                     count += 1
                 except Exception as e:
                     LOG.warning(f"Failed to write claim: {e}")
                 
     return count
+
+
+def _load_chunks_for_post(topic: str, channel: str, post_id_raw: str) -> List[Tuple[str, int]]:
+    """
+    优先读取已落库的 Chunk，确保抽取阶段与图谱中的 chunk_id 完全一致。
+    返回: [(chunk_text, chunk_index), ...]
+    """
+    post_global_id = _post_global_id(topic, channel, str(post_id_raw).strip())
+    rows: List[Tuple[str, int]] = []
+    try:
+        with get_session() as session:
+            result = session.run(
+                """
+                MATCH (p:Post {id: $pid})-[:HAS_CHUNK]->(c:Chunk)
+                RETURN c.chunk_index AS chunk_index, c.text AS text
+                ORDER BY c.chunk_index ASC
+                """,
+                {"pid": post_global_id},
+            )
+            for r in result:
+                text = str(r.get("text") or "").strip()
+                idx_raw = r.get("chunk_index")
+                if not text:
+                    continue
+                try:
+                    idx = int(idx_raw)
+                except Exception:
+                    continue
+                rows.append((text, idx))
+    except Exception as e:
+        LOG.warning("Load chunks for post failed: %s", e)
+    return rows
 
 
 def run_entity_extraction_for_sync(
@@ -219,47 +258,64 @@ def run_entity_extraction_for_sync(
     extract_fn: Optional[Any] = None,
     enable_llm: bool = False,
     pre_fetched_llm_result: Optional[Dict[str, Any]] = None,
+    chunk_size: int = 512,
+    chunk_overlap: int = 50,
 ) -> Tuple[int, int]:
     """
-    对一批 Post 行执行：Entity 粗提 + MENTIONS；
-    不再创建基于 classification 的 Topic 节点（classification 已作为 Post 属性）。
-    pre_fetched_llm_result: 可选，预先获取的 LLM 结果（用于并发优化）
-    返回 (mentions_count, topics_count)。topics_count 始终为 0。
+    对一批 Post 行执行：Chunk 切分 + LLM 抽取 (Entity/Claim) + 写入 (Chunk粒度)。
+    Pre-requisite: Chunks must be created via run_chunk_embedding_for_sync BEFORE calling this.
     """
     mentions = 0
     topics = 0
+    
+    # Import chunker here to avoid circular imports if placed at top
+    from ..rag.core.chunker import ChunkConfig, TextChunker
+    chunker = TextChunker(config=ChunkConfig(chunk_size=chunk_size, chunk_overlap=chunk_overlap))
+
     for row in rows:
         post_id = row.get("id")
         contents = row.get("contents") or ""
-        # classification = row.get("classification") or "未知" # 已作为 Post 属性，不再需要独立节点
         if post_id is None or not str(post_id).strip():
             continue
             
+        # 1) 优先读取 Neo4j 中已存在的 Chunk，保证 chunk_id 一致。
+        # 2) 若缺失，再用同参数重切作为兜底（并提示日志）。
+        chunks = _load_chunks_for_post(topic, channel, str(post_id))
+        if not chunks:
+            chunks = chunker.chunk_by_size(str(contents).strip())
+            if chunks:
+                LOG.warning(
+                    "No persisted chunks for post %s; using fallback rechunk with size=%s overlap=%s",
+                    post_id,
+                    chunk_size,
+                    chunk_overlap,
+                )
+        
         if enable_llm:
-            try:
-                # LLM 抽取实体和观点
-                if pre_fetched_llm_result is not None:
-                    res = pre_fetched_llm_result
-                else:
-                    res = extract_with_llm(contents)
-                
-                ents = res.get("entities", [])
-                claims = res.get("claims", [])
-                
-                # 写入实体
-                mentions += _write_entities(topic, channel, str(post_id), ents)
-                
-                # 写入观点
-                write_claims_for_post(topic, channel, str(post_id), claims)
-            except Exception as e:
-                LOG.warning(f"LLM extraction failed for post {post_id}: {e}")
+            for chunk_text, chunk_index in chunks:
+                try:
+                    # LLM 抽取实体和观点 (Per Chunk)
+                    # Note: pre_fetched_llm_result is not supported for chunk-level yet
+                    res = extract_with_llm(chunk_text)
+                    
+                    ents = res.get("entities", [])
+                    claims = res.get("claims", [])
+                    
+                    # 写入实体 (Chunk Level)
+                    mentions += _write_entities_for_chunk(topic, channel, str(post_id), chunk_index, ents)
+                    
+                    # 写入观点 (Chunk Level)
+                    _write_claims_for_chunk(topic, channel, str(post_id), chunk_index, claims)
+                    
+                except Exception as e:
+                    LOG.warning(f"LLM extraction failed for post {post_id} chunk {chunk_index}: {e}")
         else:
-            # 默认粗提取
-            mentions += write_entities_for_post(
-                topic, channel, str(post_id), contents, extract_fn=extract_fn
-            )
+            local_extract_fn = extract_fn or extract_entities_naive
+            for chunk_text, chunk_index in chunks:
+                try:
+                    ents = local_extract_fn(chunk_text) or []
+                    mentions += _write_entities_for_chunk(topic, channel, str(post_id), chunk_index, ents)
+                except Exception as e:
+                    LOG.warning(f"Naive extraction failed for post {post_id} chunk {chunk_index}: {e}")
             
-        # 不再创建 Topic 节点
-        # write_topic_for_post(topic, channel, str(post_id), classification)
-        # topics += 1
     return mentions, topics

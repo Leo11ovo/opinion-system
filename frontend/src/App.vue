@@ -361,6 +361,12 @@ const navigationGroups = [
         description: '多模型协同检索',
         to: { name: 'data-retrieval-routerrag' },
         icon: ArrowsRightLeftIcon
+      },
+      {
+        label: 'GraphRAG 测试台',
+        description: '查询/召回/生成可视化',
+        to: { name: 'data-retrieval-graphrag-lab' },
+        icon: BeakerIcon
       }
     ]
   },

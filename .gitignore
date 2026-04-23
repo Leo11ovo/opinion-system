@@ -57,12 +57,14 @@ cache/
 # Scripts
 scripts/
 
-# Temp
-.tmp/
-.tmp-*/
-.tmp_pytest/
+# Local models (do not commit)
+backend/models/
 
-# Logs
-*.log
-merge/frontend/.vite/
-frontend/.vite/
+*.lance
+
+backend/src/utils/rag/tagrag/vector_db/test.lance/_versions/18446744073709551614.manifest
+backend/src/utils/rag/tagrag/vector_db/test.lance/_transactions/0-b0bb3879-13a4-4752-a688-70ea878aa954.txn
+backend/src/utils/rag/tagrag/format_db/test.json
+backend/src/utils/rag/tagrag/format_db/test_with_graph.json
+backend/src/utils/rag/tagrag/format_db/控烟_with_graph.json
+backend/src/utils/rag/ragrouter/test数据库/vector_db/normalrag.lance/data/111100111011010100110111f6c88748ae8fba61b051d17ec4.lance

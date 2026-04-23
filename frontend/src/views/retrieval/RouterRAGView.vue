@@ -72,6 +72,22 @@
               {{ mode.label }}
             </button>
           </div>
+
+          <div class="mt-3 flex items-center justify-center gap-3 text-xs">
+            <span class="font-medium text-gray-500">检索策略：</span>
+            <button type="button" @click="pureMode = true" :class="[
+              'rounded-full px-3 py-1 font-medium transition',
+              pureMode ? 'bg-emerald-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+            ]">
+              纯净检索（推荐做评测）
+            </button>
+            <button type="button" @click="pureMode = false" :class="[
+              'rounded-full px-3 py-1 font-medium transition',
+              !pureMode ? 'bg-brand-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+            ]">
+              增强检索（默认）
+            </button>
+          </div>
         </form>
 
         <div v-if="ragRetrievalState.error" class="mx-auto mt-4 max-w-lg rounded-lg bg-red-50 p-3 text-sm text-red-600">
@@ -79,12 +95,109 @@
         </div>
       </section>
 
+      <section class="mb-8 rounded-2xl border border-indigo-100 bg-indigo-50/40 p-5">
+        <div class="mb-3 flex items-center justify-between">
+          <h3 class="text-base font-bold text-gray-900">RLHF 自动调参</h3>
+          <span class="text-xs text-indigo-700">基于反馈数据自动给出检索参数建议</span>
+        </div>
+
+        <div class="grid gap-3 sm:grid-cols-4">
+          <label class="text-xs text-gray-600">
+            专题
+            <input v-model.trim="ragRlhfForm.topic" type="text" placeholder="默认使用当前检索专题"
+              class="mt-1 w-full rounded-md border-gray-300 text-sm focus:border-indigo-500 focus:ring-indigo-500" />
+          </label>
+          <label class="text-xs text-gray-600">
+            实验标签
+            <input v-model.trim="ragRlhfForm.experiment_tag" type="text" placeholder="可留空"
+              class="mt-1 w-full rounded-md border-gray-300 text-sm focus:border-indigo-500 focus:ring-indigo-500" />
+          </label>
+          <label class="text-xs text-gray-600">
+            反馈样本上限
+            <input v-model.number="ragRlhfForm.limit" type="number" min="10" max="5000"
+              class="mt-1 w-full rounded-md border-gray-300 text-sm focus:border-indigo-500 focus:ring-indigo-500" />
+          </label>
+          <div class="flex items-end gap-2">
+            <button @click="handleLoadRlhfStats" :disabled="ragRlhfStatsState.loading"
+              class="rounded-md bg-indigo-600 px-3 py-2 text-xs font-semibold text-white hover:bg-indigo-700 disabled:opacity-50">
+              {{ ragRlhfStatsState.loading ? '统计中...' : '拉取统计' }}
+            </button>
+            <button @click="handleRlhfSuggest" :disabled="ragRlhfTuneState.loading"
+              class="rounded-md bg-slate-700 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50">
+              {{ ragRlhfTuneState.loading ? '计算中...' : '生成建议' }}
+            </button>
+            <button @click="handleRlhfApply" :disabled="ragRlhfTuneState.loading || !canApplyRlhf"
+              class="rounded-md bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50">
+              {{ ragRlhfTuneState.loading ? '应用中...' : '应用建议' }}
+            </button>
+          </div>
+        </div>
+
+        <p v-if="ragRlhfStatsState.error" class="mt-2 text-xs text-red-600">{{ ragRlhfStatsState.error }}</p>
+        <p v-if="ragRlhfTuneState.error" class="mt-1 text-xs text-red-600">{{ ragRlhfTuneState.error }}</p>
+
+        <div v-if="ragRlhfStatsState.data" class="mt-3 rounded-lg border border-indigo-100 bg-white p-3 text-xs text-gray-700">
+          <div class="flex flex-wrap gap-4">
+            <span>反馈数: <b>{{ ragRlhfStatsState.data.total_feedback || 0 }}</b></span>
+            <span>平均奖励: <b>{{ ragRlhfStatsState.data.avg_reward ?? 0 }}</b></span>
+            <span>专题: <b>{{ ragRlhfStatsState.data.topic || '-' }}</b></span>
+          </div>
+          <p v-if="(ragRlhfStatsState.data.total_feedback || 0) < 8" class="mt-1 text-amber-700">
+            当前反馈样本不足 8 条，仅能出建议，不会写入配置。
+          </p>
+        </div>
+
+        <div v-if="ragRlhfTuneState.result?.suggested_retrieval" class="mt-3 rounded-lg border border-emerald-100 bg-white p-3">
+          <p class="mb-1 text-xs font-semibold text-emerald-700">建议参数</p>
+          <pre class="overflow-auto rounded bg-gray-50 p-2 text-xs text-gray-700">{{ JSON.stringify(ragRlhfTuneState.result.suggested_retrieval, null, 2) }}</pre>
+          <p class="mt-2 text-xs text-gray-600">原因：{{ (ragRlhfTuneState.result.reasons || []).join('；') || '无' }}</p>
+          <p v-if="ragRlhfTuneState.result.applied" class="mt-1 text-xs font-medium text-emerald-700">已写入后端 RAG 配置。</p>
+          <p v-else-if="ragRlhfTuneState.result.blocked_reason" class="mt-1 text-xs font-medium text-amber-700">
+            {{ ragRlhfTuneState.result.blocked_reason }}
+          </p>
+        </div>
+
+        <div class="mt-4 rounded-lg border border-slate-200 bg-white p-3">
+          <p class="mb-2 text-xs font-semibold text-slate-700">快速反馈（先积累样本再调参）</p>
+          <div class="grid gap-2 sm:grid-cols-4">
+            <label class="text-xs text-gray-600">
+              相关性(1-5)
+              <input v-model.number="feedbackForm.relevance" type="number" min="1" max="5"
+                class="mt-1 w-full rounded border-gray-300 text-xs focus:border-indigo-500 focus:ring-indigo-500" />
+            </label>
+            <label class="text-xs text-gray-600">
+              完整性(1-5)
+              <input v-model.number="feedbackForm.completeness" type="number" min="1" max="5"
+                class="mt-1 w-full rounded border-gray-300 text-xs focus:border-indigo-500 focus:ring-indigo-500" />
+            </label>
+            <label class="text-xs text-gray-600 sm:col-span-2">
+              问题说明（可选）
+              <input v-model.trim="feedbackForm.bad_reason" type="text" placeholder="例如：召回偏题/不完整"
+                class="mt-1 w-full rounded border-gray-300 text-xs focus:border-indigo-500 focus:ring-indigo-500" />
+            </label>
+          </div>
+          <div class="mt-2 flex items-center gap-2">
+            <button @click="handleSubmitFeedback" :disabled="ragFeedbackState.loading"
+              class="rounded-md bg-slate-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50">
+              {{ ragFeedbackState.loading ? '提交中...' : '提交反馈' }}
+            </button>
+            <span v-if="ragFeedbackState.success" class="text-xs text-emerald-700">{{ ragFeedbackState.success }}</span>
+            <span v-if="ragFeedbackState.error" class="text-xs text-red-600">{{ ragFeedbackState.error }}</span>
+          </div>
+        </div>
+      </section>
+
       <!-- 2. 结果展示区 -->
-      <section v-if="ragRetrievalState.results.length > 0" class="animate-fade-in-up space-y-6">
+      <section v-if="ragRetrievalState.results.length > 0 || ragRetrievalState.summary" class="animate-fade-in-up space-y-6">
         <div class="flex items-end justify-between border-b border-gray-200 pb-2">
           <div>
             <h3 class="text-lg font-bold text-gray-900">检索结果</h3>
-            <p class="text-sm text-gray-500">找到 {{ ragRetrievalState.total }} 条相关片段</p>
+            <p class="text-sm text-gray-500">
+              找到 {{ ragRetrievalState.total }} 条相关片段
+              <span v-if="ragRetrievalState.raw_total > ragRetrievalState.total">
+                （原始召回 {{ ragRetrievalState.raw_total }} 条）
+              </span>
+            </p>
           </div>
           <button @click="exportResults"
             class="text-sm font-medium text-brand-600 hover:text-brand-800 hover:underline">
@@ -212,7 +325,7 @@
 
           <div>
             <div class="mb-2 flex items-center justify-between">
-              <label class="block text-sm font-medium text-gray-700">从远程数据构建新库</label>
+              <label class="block text-sm font-medium text-gray-700">构建新库</label>
               <button @click="refreshRemoteTopics" :disabled="remoteTopicsState.loading"
                 class="text-xs text-brand-600 hover:underline">
                 {{ remoteTopicsState.loading ? '加载源数据...' : '刷新源数据' }}
@@ -231,10 +344,64 @@
                 class="w-full rounded-lg bg-brand-600 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-brand-700 disabled:opacity-50">
                 {{ ragBuildState.loading ? '正在构建索引 (耗时较长)...' : '开始构建索引' }}
               </button>
+
+              <div class="rounded-lg border border-gray-200 bg-white p-3">
+                <p class="mb-2 text-xs font-semibold text-gray-600">A/B 构建参数</p>
+                <div class="grid grid-cols-2 gap-2">
+                  <label class="text-xs text-gray-500">
+                    采样比例
+                    <input v-model.number="ragBuildForm.sample_ratio" type="number" min="0.01" max="1" step="0.01"
+                      class="mt-1 w-full rounded border-gray-300 text-xs focus:border-brand-500 focus:ring-brand-500" />
+                  </label>
+                  <label class="text-xs text-gray-500">
+                    分块模式
+                    <select v-model="ragBuildForm.chunk_mode"
+                      class="mt-1 w-full rounded border-gray-300 text-xs focus:border-brand-500 focus:ring-brand-500">
+                      <option value="sentence">sentence</option>
+                      <option value="window">window</option>
+                    </select>
+                  </label>
+                  <label class="text-xs text-gray-500">
+                    chunk_size
+                    <input v-model.number="ragBuildForm.chunk_size" type="number" min="80" max="1000" step="10"
+                      class="mt-1 w-full rounded border-gray-300 text-xs focus:border-brand-500 focus:ring-brand-500" />
+                  </label>
+                  <label class="text-xs text-gray-500">
+                    chunk_overlap
+                    <input v-model.number="ragBuildForm.chunk_overlap" type="number" min="0" max="500" step="10"
+                      class="mt-1 w-full rounded border-gray-300 text-xs focus:border-brand-500 focus:ring-brand-500" />
+                  </label>
+                </div>
+                <label class="mt-2 flex items-center gap-2 text-xs text-gray-600">
+                  <input v-model="ragBuildForm.force_rebuild" type="checkbox"
+                    class="rounded border-gray-300 text-brand-600 focus:ring-brand-500" />
+                  强制重建（删除该专题旧索引后重跑）
+                </label>
+              </div>
             </div>
 
             <p v-if="ragBuildState.error" class="mt-2 text-xs text-red-600">{{ ragBuildState.error }}</p>
             <p class="mt-2 text-xs text-gray-400">注意：构建索引可能需要几分钟时间，构建完成后需刷新列表。</p>
+          </div>
+
+          <div>
+            <label class="mb-2 block text-sm font-medium text-gray-700">手动导入已有索引（高级）</label>
+            <div class="space-y-3 rounded-xl border border-amber-100 bg-amber-50/40 p-4">
+              <input v-model.trim="manualImport.topic" type="text" placeholder="目标专题名（例如：test）"
+                class="w-full rounded-lg border-gray-300 text-sm focus:border-brand-500 focus:ring-brand-500" />
+              <input v-model.trim="manualImport.source_path" type="text"
+                placeholder="索引路径（.lance / vector_db / 含vector_db的专题目录）"
+                class="w-full rounded-lg border-gray-300 text-sm focus:border-brand-500 focus:ring-brand-500" />
+              <button @click="handleManualImport"
+                :disabled="ragImportState.loading || !manualImport.topic || !manualImport.source_path"
+                class="w-full rounded-lg bg-amber-600 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-amber-700 disabled:opacity-50">
+                {{ ragImportState.loading ? '导入中...' : '导入已有索引' }}
+              </button>
+            </div>
+            <p v-if="ragImportState.error" class="mt-2 text-xs text-red-600">{{ ragImportState.error }}</p>
+            <p v-else-if="ragImportState.result" class="mt-2 text-xs text-emerald-700">
+              导入完成：{{ ragImportState.result.imported_count || 0 }} 项，表：{{ (ragImportState.result.tables || []).join(', ') || '无' }}
+            </p>
           </div>
         </div>
       </div>
@@ -257,20 +424,42 @@ const {
   routerTopicOptions,
   remoteTopicsState,
   remoteTopicOptions,
+  localTopicsState,
+  localTopicOptions,
   ragSearchForm,
   ragRetrievalState,
   ragCacheState,
   ragBuildState,
   ragBuildForm,
+  ragImportState,
+  ragRlhfForm,
+  ragRlhfStatsState,
+  ragRlhfTuneState,
+  ragFeedbackState,
   loadRAGTopics,
   loadRemoteTopics,
+  loadLocalTopics,
   buildRagTopic,
+  importRouterRAGArtifacts,
   retrieveRouterRAG,
-  retrieveTagRAG
+  retrieveTagRAG,
+  fetchRouterRlhfStats,
+  tuneRouterRlhf,
+  submitRouterRAGFeedback
 } = useRAGTopics()
 
 const hasSearched = computed(() => ragRetrievalState.error !== '' || ragRetrievalState.results.length > 0)
 const showManageModal = ref(false)
+const pureMode = ref(true)
+const manualImport = ref({
+  topic: '',
+  source_path: ''
+})
+const feedbackForm = ref({
+  relevance: 3,
+  completeness: 3,
+  bad_reason: ''
+})
 
 const selectableTopics = computed(() => {
   if (ragSearchForm.rag_type === 'tagrag') return tagragTopicOptions.value
@@ -290,7 +479,7 @@ const remoteTopicSelectOptions = computed(() => [
 
 const retrievalModes = [
   { value: 'routerrag', label: '语义检索 (Semantic)' },
-  { value: 'graphrag', label: '图谱探索 (Graph)' },
+  { value: 'graphrag', label: '图数据库检索 (Neo4j)' },
   { value: 'tagrag', label: '标签检索 (Tag)' },
   { value: 'hybrid', label: '混合模式' }
 ]
@@ -306,11 +495,28 @@ const refreshRemoteTopics = async () => {
 const handleBuild = async () => {
   try {
     const buildType = ragSearchForm.rag_type === 'tagrag' ? 'tagrag' : 'routerrag'
-    await buildRagTopic({ type: buildType })
+    await buildRagTopic({
+      type: buildType,
+      source_type: ragBuildForm.source_type,
+      build_topic: ragBuildForm.build_topic,
+      local_source_dir: ragBuildForm.local_source_dir
+    })
   } catch (error) {
     // Error handled in composable
   }
 }
+
+const selectedBuildTopic = computed(() => {
+  const manualTopic = String(ragBuildForm.build_topic || '').trim()
+  if (manualTopic) return manualTopic
+  if (ragBuildForm.source_type === 'local') return ragBuildForm.local_topic
+  if (ragBuildForm.source_type === 'dir') return manualTopic
+  return ragBuildForm.remote_topic
+})
+const canApplyRlhf = computed(() => {
+  const total = Number(ragRlhfStatsState.data?.total_feedback || 0)
+  return total >= 8
+})
 
 const handleSearch = async () => {
   if (!ragSearchForm.query || !ragSearchForm.topic) {
@@ -321,10 +527,83 @@ const handleSearch = async () => {
     if (ragSearchForm.rag_type === 'tagrag') {
       await retrieveTagRAG()
     } else {
-      await retrieveRouterRAG()
+      await retrieveRouterRAG({
+        use_question_preset: !pureMode.value,
+        enable_expert_overlay: !pureMode.value,
+        enable_expert_rewrite: !pureMode.value,
+        enable_expert_hints: !pureMode.value,
+        enable_expert_answer_structure: !pureMode.value,
+        experiment_tag: pureMode.value ? 'pure' : 'enhanced'
+      })
     }
   } catch (error) {
     // Error handled
+  }
+}
+
+const handleManualImport = async () => {
+  try {
+    await importRouterRAGArtifacts({
+      topic: manualImport.value.topic,
+      source_path: manualImport.value.source_path
+    })
+  } catch (error) {
+    // Error handled in composable
+  }
+}
+
+const handleLoadRlhfStats = async () => {
+  try {
+    await fetchRouterRlhfStats({
+      topic: ragRlhfForm.topic || ragSearchForm.topic,
+      experiment_tag: ragRlhfForm.experiment_tag,
+      limit: ragRlhfForm.limit
+    })
+  } catch (error) {
+    // handled in composable
+  }
+}
+
+const handleRlhfSuggest = async () => {
+  try {
+    await tuneRouterRlhf({
+      topic: ragRlhfForm.topic || ragSearchForm.topic,
+      experiment_tag: ragRlhfForm.experiment_tag,
+      limit: ragRlhfForm.limit,
+      apply: false
+    })
+  } catch (error) {
+    // handled in composable
+  }
+}
+
+const handleRlhfApply = async () => {
+  try {
+    await tuneRouterRlhf({
+      topic: ragRlhfForm.topic || ragSearchForm.topic,
+      experiment_tag: ragRlhfForm.experiment_tag,
+      limit: ragRlhfForm.limit,
+      apply: true
+    })
+  } catch (error) {
+    // handled in composable
+  }
+}
+
+const handleSubmitFeedback = async () => {
+  try {
+    await submitRouterRAGFeedback({
+      topic: ragSearchForm.topic,
+      question: ragSearchForm.query,
+      experiment_tag: pureMode.value ? 'pure' : 'enhanced',
+      scores: {
+        relevance: Number(feedbackForm.value.relevance || 0),
+        completeness: Number(feedbackForm.value.completeness || 0)
+      },
+      bad_reason: feedbackForm.value.bad_reason
+    })
+  } catch (error) {
+    // handled in composable
   }
 }
 
@@ -373,11 +652,19 @@ const exportResults = () => {
 onMounted(() => {
   loadTopics()
   loadRemoteTopics()
+  loadLocalTopics()
 })
+
+const refreshLocalTopics = async () => {
+  await loadLocalTopics()
+}
 
 watch(selectableTopics, (options) => {
   if (options.length > 0 && !options.includes(ragSearchForm.topic)) {
     ragSearchForm.topic = options[0]
+  }
+  if (!ragRlhfForm.topic && ragSearchForm.topic) {
+    ragRlhfForm.topic = ragSearchForm.topic
   }
 })
 </script>

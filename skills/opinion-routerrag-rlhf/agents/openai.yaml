@@ -1,0 +1,4 @@
+interface:
+  display_name: "RouterRAG_RLHF"
+  short_description: "RouterRAG实验排障与RLHF闭环调参流程指南"
+  default_prompt: "Use this skill to run RouterRAG build, retrieval debugging, summary troubleshooting, and feedback-driven RLHF tuning"

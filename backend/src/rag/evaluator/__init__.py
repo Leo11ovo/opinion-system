@@ -1,18 +1,27 @@
-"""RAG 评估：EvaluationData、Precision/Recall、LLM Judge。"""
+"""RAG 评估：EvaluationData、检索/生成/UX 代理指标。"""
 from .core import (
     EvaluationData,
     EvaluationDataItem,
     load_evaluation_data,
+    run_evaluation_compare,
     run_evaluation,
 )
 from .utils import (
     build_judge_prompt,
+    build_multi_judge_prompt,
     call_judge_sync,
+    call_multi_judge_sync,
     compute_precision_recall,
+    compute_topk_metrics,
+    compute_evidence_coverage,
+    compute_retriever_attribution,
+    compute_finding_stats,
     extract_retrieved_doc_ids,
+    extract_retrieved_evidence_items,
     find_relevant_docs_by_keywords,
     load_corpus_doc_texts,
     parse_judge_result,
+    parse_multi_judge_result,
 )
 
 __all__ = [
@@ -20,11 +29,20 @@ __all__ = [
     "EvaluationDataItem",
     "load_evaluation_data",
     "run_evaluation",
+    "run_evaluation_compare",
     "build_judge_prompt",
+    "build_multi_judge_prompt",
     "call_judge_sync",
+    "call_multi_judge_sync",
     "compute_precision_recall",
+    "compute_topk_metrics",
+    "compute_evidence_coverage",
+    "compute_retriever_attribution",
+    "compute_finding_stats",
     "extract_retrieved_doc_ids",
+    "extract_retrieved_evidence_items",
     "find_relevant_docs_by_keywords",
     "load_corpus_doc_texts",
     "parse_judge_result",
+    "parse_multi_judge_result",
 ]
