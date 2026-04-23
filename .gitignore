@@ -57,6 +57,9 @@ cache/
 # Scripts
 scripts/
 
+# 舆情分析用资料
+docs/
+
 # Local models (do not commit)
 backend/models/
 
