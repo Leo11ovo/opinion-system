@@ -1,6 +1,6 @@
 """
-从 MySQL 增量同步到 Neo4j：Post、Account、Platform 及 POSTED、IN_PLATFORM。
-与 Upload 产出对齐（同一批写入 MySQL 的数据）；幂等使用 MERGE。
+统一同步到 Neo4j：Post、Account、Platform 及 POSTED、IN_PLATFORM。
+兼容 Upload 历史链路，也支持直接从本地结构化文件与文档入图；幂等使用 MERGE。
 """
 from __future__ import annotations
 
@@ -153,6 +153,49 @@ def _count_nodes_by_labels(labels: List[str]) -> Dict[str, int]:
     return counts
 
 
+def _graph_db_candidates() -> List[Optional[str]]:
+    cfg_db = str(get_graph_config().get("database") or "").strip()
+    candidates: List[Optional[str]] = []
+    for name in (cfg_db, "neo4j", "opinion-report", "opinion", None):
+        if name in candidates:
+            continue
+        candidates.append(name)
+    return candidates
+
+
+def _count_nodes_by_labels_in_db(labels: List[str], database: Optional[str]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    with get_session(database=database) as session:
+        for label in labels:
+            row = session.run(f"MATCH (n:{label}) RETURN count(n) AS c").single()
+            counts[label] = int((row and row.get("c")) or 0)
+    return counts
+
+
+def _discover_graph_database(labels: List[str]) -> Dict[str, Any]:
+    last_error = ""
+    for database in _graph_db_candidates():
+        try:
+            counts = _count_nodes_by_labels_in_db(labels, database)
+            has_any_content = any(int(counts.get(label, 0) or 0) > 0 for label in labels)
+            return {
+                "connected": True,
+                "database": str(database or ""),
+                "counts": counts,
+                "has_any_content": has_any_content,
+            }
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+    return {
+        "connected": False,
+        "database": "",
+        "counts": {},
+        "has_any_content": False,
+        "error": last_error or "当前无法连接或读取任何 Neo4j database。",
+    }
+
+
 def _resolve_graph_capability(enable_entity: bool, enable_llm_extraction: bool, counts: Dict[str, int]) -> Dict[str, Any]:
     structure_labels = ["Post", "Chunk", "Topic", "Event"]
     semantic_labels = ["Entity", "Claim", "Finding"]
@@ -181,6 +224,203 @@ def _resolve_graph_capability(enable_entity: bool, enable_llm_extraction: bool, 
     }
 
 
+def inspect_graph_status() -> Dict[str, Any]:
+    """
+    读取当前 Neo4j 图谱状态，用于前端优先判断“是否可直接提问”。
+    这里只返回静态状态，不触发任何入图或回填动作。
+    """
+    cfg = get_graph_config()
+    configured_database = str(cfg.get("database") or "").strip()
+    enable_entity = bool(cfg.get("enable_entity_extraction", False))
+
+    if not is_neo4j_configured():
+        return {
+            "status": "not_configured",
+            "configured": False,
+            "connected": False,
+            "database": configured_database,
+            "configured_database": configured_database,
+            "graph_capability": {
+                "mode": "empty",
+                "summary": "Neo4j 未配置，当前无法读取图谱状态。",
+                "is_degraded": True,
+                "llm_extraction_enabled": False,
+                "entity_extraction_enabled": enable_entity,
+            },
+            "counts": {},
+            "ready_for_query": False,
+            "message": "Neo4j 未配置",
+        }
+
+    labels = ["Post", "Chunk", "Entity", "Claim", "Topic", "Event", "Finding", "Report", "Section", "Recommendation", "Metric"]
+
+    try:
+        discovered = _discover_graph_database(labels)
+        if not discovered.get("connected"):
+            raise RuntimeError(str(discovered.get("error") or "图谱状态读取失败"))
+        counts = discovered.get("counts") or {}
+        effective_database = str(discovered.get("database") or "")
+        capability = _resolve_graph_capability(enable_entity, False, counts)
+        has_graph_content = any(int(counts.get(label, 0) or 0) > 0 for label in ["Post", "Chunk", "Finding", "Entity", "Claim"])
+        has_findings = int(counts.get("Finding", 0) or 0) > 0
+        has_vector_indexes = False
+        try:
+            with get_session(database=effective_database or None) as session:
+                row = session.run(
+                    "SHOW VECTOR INDEXES YIELD name, state "
+                    "WHERE state='ONLINE' "
+                    "RETURN count(name) AS c"
+                ).single()
+                has_vector_indexes = int((row and row.get("c")) or 0) > 0
+        except Exception:
+            has_vector_indexes = False
+
+        return {
+            "status": "ok",
+            "configured": True,
+            "connected": True,
+            "database": effective_database or configured_database,
+            "configured_database": configured_database,
+            "counts": counts,
+            "graph_capability": capability,
+            "ready_for_query": bool(has_graph_content),
+            "has_findings": has_findings,
+            "has_vector_indexes": has_vector_indexes,
+            "message": "图谱状态读取成功",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "configured": True,
+            "connected": False,
+            "database": configured_database,
+            "configured_database": configured_database,
+            "counts": {},
+            "graph_capability": {
+                "mode": "empty",
+                "summary": f"Neo4j 可配置，但当前无法读取图谱状态：{exc}",
+                "is_degraded": True,
+                "llm_extraction_enabled": False,
+                "entity_extraction_enabled": enable_entity,
+            },
+            "ready_for_query": False,
+            "message": str(exc),
+        }
+
+
+def list_graph_topics() -> Dict[str, Any]:
+    """
+    直接从 Neo4j 当前数据库中列出可用图谱专题。
+    不依赖 RouterRAG 本地目录或 LanceDB 产物。
+    """
+    cfg = get_graph_config()
+    configured_database = str(cfg.get("database") or "").strip()
+
+    if not is_neo4j_configured():
+        return {
+            "status": "not_configured",
+            "configured": False,
+            "connected": False,
+            "database": configured_database,
+            "configured_database": configured_database,
+            "topics": [],
+            "message": "Neo4j 未配置",
+        }
+
+    topic_values: set[str] = set()
+    try:
+        labels = ["Post", "Chunk", "Entity", "Claim", "Topic", "Event", "Finding", "Report", "Section"]
+        discovered = _discover_graph_database(labels)
+        if not discovered.get("connected"):
+            raise RuntimeError(str(discovered.get("error") or "图谱专题读取失败"))
+        effective_database = str(discovered.get("database") or "")
+
+        with get_session(database=effective_database or None) as session:
+            queries = [
+                "MATCH (r:Report) WHERE coalesce(r.topic, '') <> '' RETURN DISTINCT r.topic AS topic LIMIT 200",
+                "MATCH (p:Post) WHERE coalesce(p.topic, '') <> '' RETURN DISTINCT p.topic AS topic LIMIT 200",
+                "MATCH (t:Topic) WHERE coalesce(t.project, '') <> '' RETURN DISTINCT t.project AS topic LIMIT 200",
+            ]
+            for cypher in queries:
+                try:
+                    rows = session.run(cypher).data()
+                except Exception:
+                    rows = []
+                for row in rows:
+                    value = str(row.get("topic") or "").strip()
+                    if value:
+                        topic_values.add(value)
+
+        topics = sorted(topic_values)
+        topic_items: List[Dict[str, Any]] = []
+        with get_session(database=effective_database or None) as session:
+            for topic in topics:
+                post_row = session.run(
+                    "MATCH (p:Post) WHERE coalesce(p.topic, '') = $topic RETURN count(p) AS c",
+                    {"topic": topic},
+                ).single()
+                finding_row = session.run(
+                    """
+                    MATCH (f:Finding)
+                    WHERE coalesce(f.report_id, '') STARTS WITH ($topic + '_')
+                       OR coalesce(f.id, '') STARTS WITH ($topic + '_')
+                    RETURN count(f) AS c
+                    """,
+                    {"topic": topic},
+                ).single()
+                claim_row = session.run(
+                    "MATCH (c:Claim) WHERE coalesce(c.topic, '') = $topic RETURN count(c) AS c",
+                    {"topic": topic},
+                ).single()
+                entity_row = session.run(
+                    "MATCH (e:Entity) WHERE coalesce(e.topic, '') = $topic RETURN count(e) AS c",
+                    {"topic": topic},
+                ).single()
+                report_row = session.run(
+                    "MATCH (r:Report) WHERE coalesce(r.topic, '') = $topic RETURN count(r) AS c",
+                    {"topic": topic},
+                ).single()
+
+                posts = int((post_row and post_row.get("c")) or 0)
+                findings = int((finding_row and finding_row.get("c")) or 0)
+                claims = int((claim_row and claim_row.get("c")) or 0)
+                entities = int((entity_row and entity_row.get("c")) or 0)
+                reports = int((report_row and report_row.get("c")) or 0)
+                topic_items.append(
+                    {
+                        "name": topic,
+                        "counts": {
+                            "posts": posts,
+                            "findings": findings,
+                            "claims": claims,
+                            "entities": entities,
+                            "reports": reports,
+                        },
+                        "size_hint": findings or posts or claims or entities or reports,
+                    }
+                )
+        return {
+            "status": "ok",
+            "configured": True,
+            "connected": True,
+            "database": effective_database or configured_database,
+            "configured_database": configured_database,
+            "topics": topics,
+            "topic_items": topic_items,
+            "message": "图谱专题读取成功",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "configured": True,
+            "connected": False,
+            "database": configured_database,
+            "configured_database": configured_database,
+            "topics": [],
+            "message": str(exc),
+        }
+
+
 def sync_after_upload(
     topic: str,
     date: str,
@@ -194,9 +434,10 @@ def sync_after_upload(
     source_bucket: str = "filter",
 ) -> Dict[str, Any]:
     """
-    在 Upload 成功后调用：将本批 MySQL 数据同步到 Neo4j。
-    topic、date、dataset_name 与 upload_filtered_excels 一致。
-    仅同步 Post、Account、Platform 及 POSTED、IN_PLATFORM；
+    在 Upload 成功后调用：将本批数据同步到 Neo4j。
+    topic、date、dataset_name 与 upload_filtered_excels 历史链路保持兼容。
+    支持数据库表、本地结构化文件与报告文档统一入图；
+    默认同步 Post、Account、Platform 及 POSTED、IN_PLATFORM；
     若 enable_entity_extraction / enable_chunk_embedding 为 True 则调用对应模块（见后续实现）。
     """
     if logger is None:

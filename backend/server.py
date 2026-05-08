@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import json
 import logging
@@ -2135,7 +2136,7 @@ def graph_build_endpoint():
         except ValueError as exc:
             return jsonify({"status": "error", "message": str(exc)}), 400
 
-    from src.graph.sync_mysql_to_neo4j import sync_after_upload  # type: ignore
+    from src.graph.sync_to_neo4j import sync_after_upload  # type: ignore
 
     def _as_bool(value: Any, default: bool) -> bool:
         if value is None:
@@ -2176,6 +2177,30 @@ def graph_build_endpoint():
                 "enable_llm_extraction": enable_llm_extraction,
             },
         },
+    )
+    return jsonify(response), code
+
+
+@app.get("/api/graph/status")
+def graph_status_endpoint():
+    from src.graph.sync_to_neo4j import inspect_graph_status  # type: ignore
+
+    response, code = _execute_operation(
+        "graph_status",
+        inspect_graph_status,
+        log_context={"params": {"source": "api"}},
+    )
+    return jsonify(response), code
+
+
+@app.get("/api/graph/topics")
+def graph_topics_endpoint():
+    from src.graph.sync_to_neo4j import list_graph_topics  # type: ignore
+
+    response, code = _execute_operation(
+        "graph_topics",
+        list_graph_topics,
+        log_context={"params": {"source": "api"}},
     )
     return jsonify(response), code
 
@@ -3988,6 +4013,192 @@ def routerrag_retrieve():
     except Exception as exc:
         LOGGER.exception("Failed to retrieve RouterRAG documents")
         return error(f"RouterRAG检索失败: {str(exc)}")
+
+
+async def _generate_graphrag_summary(
+    query: str,
+    findings: List[Dict[str, Any]],
+    evidence: Dict[str, Any],
+    topics: List[str],
+    events: List[str],
+    recommendations: List[str],
+) -> str:
+    """使用 LLM 将 GraphRAG 检索结果整理成自然语言摘要。"""
+    from src.utils.ai.qwen import QwenClient
+    from src.utils.setting.settings import settings
+
+    try:
+        llm_config = settings.get_llm_config()
+        router_cfg = llm_config.get("router_retrieve_llm", {})
+        model = str(router_cfg.get("model", "qwen-plus")).strip() or "qwen-plus"
+        api_key = router_cfg.get("api_key") or llm_config.get("api_key")
+        if not api_key:
+            from src.utils.setting.env_loader import get_api_key
+            api_key = get_api_key()
+        client = QwenClient(api_key=api_key)
+
+        # 构建上下文
+        ctx_parts = []
+        if topics:
+            ctx_parts.append(f"【主题】{', '.join(topics)}")
+        if events:
+            ctx_parts.append(f"【相关事件】{', '.join(events)}")
+        if recommendations:
+            ctx_parts.append(f"【建议】{'；'.join(recommendations[:3])}")
+
+        ctx_parts.append(
+            f"【证据统计】Claim {int(evidence.get('claim_count') or 0)} 条，"
+            f"Chunk {int(evidence.get('chunk_count') or 0)} 条，"
+            f"Post {int(evidence.get('post_count') or 0)} 条。"
+        )
+
+        ctx_parts.append(f"【GraphRAG 命中，共 {len(findings)} 条】")
+        for i, item in enumerate(findings, 1):
+            title = str(item.get("finding_title") or "").strip()
+            stmt = str(item.get("finding_statement") or "").strip()
+            claims = "; ".join([str(x) for x in (item.get("claims") or []) if x])[:120]
+            posts = "; ".join([str(x) for x in (item.get("post_titles") or []) if x])[:80]
+            ctx_parts.append(f"\n— Finding {i} —")
+            if title:
+                ctx_parts.append(f"标题：{title}")
+            if stmt:
+                ctx_parts.append(f"内容：{stmt[:300]}")
+            if claims:
+                ctx_parts.append(f"相关Claim：{claims}")
+            if posts:
+                ctx_parts.append(f"相关帖子：{posts}")
+
+        context = "\n".join(ctx_parts)
+
+        prompt = f"""请根据以下 GraphRAG 检索结果，回答用户的问题，并整理成结构化的摘要报告。
+
+用户问题：{query}
+
+检索到的资料：
+{context}
+
+请按以下格式整理：
+
+1. 核心发现（3-5条）
+   - 发现1
+   - 发现2
+   ...
+
+2. 详细说明
+   （基于检索资料的详细阐述，注意过滤掉目录碎片、页码等干扰内容）
+
+3. 数据来源
+   （说明信息来源，例如：来自某报告的 Finding 节点、Claim 证据等）
+
+**严格要求：**
+- 只能使用检索到的资料中的信息，严禁添加任何外部知识
+- 如果 Finding 内容实际是目录、页码、章节标题等碎片，应标注"该 finding 内容为报告目录/章节标题，非有效发现"
+- 每个要点必须能在检索资料中找到明确依据
+- 结构清晰，突出重点
+
+请开始整理："""
+
+        resp = await client.call(prompt, model=model, max_tokens=2500)
+        text = ""
+        if isinstance(resp, dict):
+            text = str(resp.get("text") or "").strip()
+        if text:
+            LOGGER.info(f"GraphRAG LLM summary generated: {len(text)} chars")
+            return text
+    except Exception as exc:
+        LOGGER.warning(f"GraphRAG LLM summary failed, using fallback: {exc}")
+
+    # Fallback: 模板字符串
+    lead = str(findings[0].get("finding_statement") or findings[0].get("finding_title") or "").strip() if findings else ""
+    summary_lines = [
+        f"当前问题命中 {len(findings)} 条 GraphRAG finding。",
+        lead or "首条 finding 已命中，但暂缺可展示的 statement。",
+    ]
+    if topics:
+        summary_lines.append("涉及主题：" + "、".join(topics) + "。")
+    if events:
+        summary_lines.append("相关事件：" + "、".join(events) + "。")
+    if recommendations:
+        summary_lines.append("可参考建议：" + "；".join(recommendations[:2]) + "。")
+    summary_lines.append(
+        "证据概况："
+        f"Claim {int(evidence.get('claim_count') or 0)} 条，"
+        f"Chunk {int(evidence.get('chunk_count') or 0)} 条，"
+        f"Post {int(evidence.get('post_count') or 0)} 条。"
+    )
+    return "\n".join(summary_lines)
+
+
+@app.post("/api/graph/retrieve")
+def graph_retrieve():
+    """纯 Neo4j GraphRAG 检索接口，不依赖 RouterRAG 本地资料。"""
+    try:
+        payload = request.get_json(silent=True) or {}
+        query = str(payload.get("query") or "").strip()
+        topic = str(payload.get("topic") or "").strip()
+        top_k = int(payload.get("top_k") or 5)
+
+        if not query:
+            return error("Missing required field: query")
+
+        from src.rag.retrievers import GraphRAGFormatter, GraphRAGRetriever
+
+        hits, diagnostics = GraphRAGRetriever().retrieve(
+            query,
+            top_k=max(1, top_k),
+            topic=topic,
+            return_diagnostics=True,
+        )
+        graphrag = GraphRAGFormatter().format(hits, max(1, top_k))
+        findings = graphrag.get("findings", []) or []
+        evidence = graphrag.get("evidence", {}) or {}
+        topics = []
+        events = []
+        recommendations = []
+        for item in findings[:3]:
+            topics.extend([str(x) for x in (item.get("topics") or []) if str(x).strip()])
+            events.extend([str(x) for x in (item.get("events") or []) if str(x).strip()])
+            recommendations.extend([str(x) for x in (item.get("recommendations") or []) if str(x).strip()])
+        topics = list(dict.fromkeys(topics))[:5]
+        events = list(dict.fromkeys(events))[:5]
+        recommendations = list(dict.fromkeys(recommendations))[:5]
+
+        if findings:
+            summary_text = asyncio.run(
+                _generate_graphrag_summary(query, findings, evidence, topics, events, recommendations)
+            )
+        else:
+            seed_counts = diagnostics.get("seed_counts") or {}
+            nonzero_seed_counts = {k: v for k, v in seed_counts.items() if int(v or 0) > 0}
+            if nonzero_seed_counts:
+                summary_text = (
+                    "当前问题未命中可展示的 GraphRAG finding。"
+                    f"已执行图检索，但只命中了中间种子节点：{nonzero_seed_counts}。"
+                    "请查看诊断信息，确认命中节点是否能正确桥接到 Finding。"
+                )
+            else:
+                summary_text = (
+                    "当前问题未命中可展示的 GraphRAG finding。"
+                    "已执行图检索，但没有命中任何 seed 节点。"
+                    "请尝试更换更贴近报告标题、章节名或核心术语的问法。"
+                )
+
+        return success(
+            {
+                "data": {
+                    "query_text": query,
+                    "topic": topic,
+                    "mode": "graphrag",
+                    "graphrag": graphrag,
+                    "diagnostics": diagnostics,
+                    "summary": summary_text,
+                    "total": len(graphrag.get("findings", []) or []),
+                }
+            }
+        )
+    except Exception as exc:
+        LOGGER.exception("Failed to retrieve pure GraphRAG documents")
+        return error(f"GraphRAG检索失败: {str(exc)}")
 
 
 @app.post("/api/rag/routerrag/feedback")

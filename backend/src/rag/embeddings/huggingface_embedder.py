@@ -20,7 +20,7 @@ class HuggingFaceEmbedder(BaseEmbedder):
         self.device = config.get("device", "auto") if config else "auto"
         self.cache_dir = config.get("cache_dir") if config else None
 
-    def _initialize_model(self):
+    def initialize(self):
         """Initialize the HuggingFace model."""
         if self.model is None:
             try:
@@ -44,7 +44,7 @@ class HuggingFaceEmbedder(BaseEmbedder):
 
     def embed(self, texts: Union[str, List[str]], **kwargs) -> Union[List[float], List[List[float]]]:
         """Generate embeddings for texts."""
-        self._initialize_model()
+        self.initialize()
 
         # Handle single text input
         if isinstance(texts, str):
@@ -71,7 +71,7 @@ class HuggingFaceEmbedder(BaseEmbedder):
 
     def embed_batch(self, texts: List[str], batch_size: int = 32, **kwargs) -> List[List[float]]:
         """Generate embeddings for a batch of texts."""
-        self._initialize_model()
+        self.initialize()
 
         try:
             embeddings = self.model.encode(
@@ -90,12 +90,12 @@ class HuggingFaceEmbedder(BaseEmbedder):
 
     def get_dimension(self) -> int:
         """Get embedding dimension."""
-        self._initialize_model()
+        self.initialize()
         return self.model.get_sentence_embedding_dimension()
 
     def save_model(self, path: Union[str, Path]):
         """Save the model to disk."""
-        self._initialize_model()
+        self.initialize()
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         self.model.save(str(path))

@@ -149,6 +149,18 @@ def _parse_labels(raw: str) -> List[str]:
     return labels
 
 
+def _clear_embeddings(database: str | None, label: str) -> int:
+    cypher = f"""
+    MATCH (n:{label})
+    WHERE n.embedding IS NOT NULL
+    SET n.embedding = NULL
+    RETURN count(n) AS cleared
+    """
+    with _session(database) as session:
+        result = session.run(cypher).data()
+    return result[0]["cleared"] if result else 0
+
+
 def backfill_graph_node_embeddings(
     database: Optional[str],
     *,
@@ -158,6 +170,7 @@ def backfill_graph_node_embeddings(
     max_concurrency: int = 5,
     limit_per_label: int = 0,
     recreate_index: bool = False,
+    clear_label: bool = False,
 ) -> Dict[str, Any]:
     selected_labels = [x for x in (labels or []) if x in LABEL_CONFIG] or ["Entity", "Claim", "Event", "Topic", "Finding"]
     client, model, dimension = get_sync_client()
@@ -170,6 +183,9 @@ def backfill_graph_node_embeddings(
     for label in selected_labels:
         cfg = LABEL_CONFIG[label]
         index_name = str(cfg["index_name"])
+        if clear_label:
+            cleared = _clear_embeddings(database, label)
+            print(f"[{label}] cleared {cleared} existing embeddings")
         rows = _fetch_seed_rows(database, label, limit_per_label)
         candidate_count = len(rows)
         total_candidates += candidate_count
@@ -233,6 +249,11 @@ def main() -> int:
     parser.add_argument("--max-concurrency", type=int, default=5, help="Max concurrent embedding API calls")
     parser.add_argument("--limit-per-label", type=int, default=0, help="Max nodes per label, 0 means all")
     parser.add_argument("--recreate-index", action="store_true", help="Drop and recreate vector indexes")
+    parser.add_argument(
+        "--clear-label",
+        action="store_true",
+        help="Clear existing embeddings for the target labels before backfilling",
+    )
     args = parser.parse_args()
 
     labels = _parse_labels(args.labels)
@@ -244,6 +265,7 @@ def main() -> int:
         max_concurrency=args.max_concurrency,
         limit_per_label=args.limit_per_label,
         recreate_index=args.recreate_index,
+        clear_label=args.clear_label,
     )
     print(f"Embedding model: {result['embedding_model']} (dim={result['embedding_dimension']})")
     print(f"Target labels: {', '.join(result['labels'])}")

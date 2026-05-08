@@ -270,14 +270,14 @@ Conceptually:
 
 `backend/src/graph/build_graph.py` is a good overview of the full graph pipeline:
 
-1. sync uploaded/local data into Neo4j via `sync_mysql_to_neo4j.py`
+1. sync uploaded/local data into Neo4j via `sync_to_neo4j.py`
 2. run entity extraction and chunk creation/embedding
 3. run BERTopic if needed
 4. sync BERTopic results back into the graph
 5. cluster posts into events
 6. rebuild NormalRAG vectors from graph-derived content
 
-`backend/src/graph/sync_mysql_to_neo4j.py` is also important because it supports both DB-backed inputs and direct local file ingestion (`jsonl`, `csv`, `pdf`, `docx`, `txt`, `md`) when syncing graph content.
+`backend/src/graph/sync_to_neo4j.py` is also important because it supports both DB-backed inputs and direct local file ingestion (`jsonl`, `csv`, `pdf`, `docx`, `txt`, `md`) when syncing graph content.
 
 ## Working conventions for this repo
 

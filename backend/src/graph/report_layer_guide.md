@@ -9,7 +9,7 @@ No old labels/relations are renamed or removed.
 
 Current standard entrypoint:
 
-- `sync_mysql_to_neo4j.py::sync_after_upload(...)`
+- `sync_to_neo4j.py::sync_after_upload(...)`
   - writes evidence layer first
   - if report files are present, ingests report layer in the same build flow
   - then runs vector backfill for graph retrieval

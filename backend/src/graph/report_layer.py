@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .neo4j_client import get_session
-from .sync_mysql_to_neo4j import _read_report_file
+from .sync_to_neo4j import _read_report_file
 
 
 def _slug(text: str) -> str:
@@ -776,13 +776,126 @@ def _event_candidates(title: str, text: str) -> List[str]:
     return result[:2]
 
 
+def _is_junk_finding_text(text: str) -> bool:
+    """判断一段文本是否属于垃圾目录/列表碎片，不适合作为 Finding。"""
+    t = str(text).strip()
+    if len(t) < 20:
+        return True
+
+    # 行数过多（>6行）且每行都很短（<25字）→ 目录/列表页
+    lines = [l.strip() for l in t.split("\n") if l.strip()]
+    if len(lines) > 6:
+        short_lines = sum(1 for l in lines if len(l) < 25)
+        if short_lines / len(lines) >= 0.7:
+            return True
+
+    # 大量纯数字或数字+章节号混在行尾（如 "3.1三大舆论场声量对比 7"）
+    # 统计含数字的行占比
+    digit_lines = sum(1 for l in lines if re.search(r"\d", l))
+    if len(lines) >= 4 and digit_lines / len(lines) >= 0.6:
+        # 进一步检查：这些行是否像目录条目（短、无句号）
+        no_punct_lines = sum(1 for l in lines if not re.search(r"[。！？；]", l))
+        if no_punct_lines / len(lines) >= 0.7:
+            return True
+
+    # 含 "目录" 关键词且大量章节编号模式（\d+\.\d+ 出现3次以上）
+    chapter_refs = len(re.findall(r"\d+\.\d+", t))
+    if chapter_refs >= 3 and ("目录" in t or "章" in t):
+        return True
+
+    # 整体文本中句号极少（中文句子终结标志）
+    sentence_endings = sum(1 for ch in t if ch in "。！？")
+    if len(t) > 100 and sentence_endings == 0:
+        return True
+
+    # 纯由短行无标点堆砌（典型的目录堆砌）
+    if len(lines) >= 3:
+        no_punct = sum(1 for l in lines if not re.search(r"[。！？；]", l))
+        avg_len = sum(len(l) for l in lines) / len(lines)
+        if no_punct / len(lines) >= 0.8 and avg_len < 30:
+            return True
+
+    return False
+
+
+def _score_finding_quality(text: str) -> float:
+    """对一段文本进行质量评分，返回 0.0~1.0。分数越高越适合作为 Finding。"""
+    t = str(text).strip()
+    score = 0.5  # 基础分
+
+    # 有中文句号 → 有完整句子结构
+    sentence_endings = sum(1 for ch in t if ch in "。！？")
+    if sentence_endings >= 1:
+        score += 0.15
+    if sentence_endings >= 3:
+        score += 0.1
+
+    # 含数字（可能包含统计数据、比例、对比）
+    if re.search(r"\d", t):
+        score += 0.08
+
+    # 含明确对比词（vs、相比、与...相比）
+    if re.search(r"(相比| versus |vs\.)", t):
+        score += 0.1
+
+    # 含结论性词（表明、显示、发现、指出）
+    if re.search(r"(表明|显示|发现|指出|证实|说明)", t):
+        score += 0.1
+
+    # 长度适中（80-400字）：太短信息不足，太长容易混入无关内容
+    if 80 <= len(t) <= 400:
+        score += 0.1
+
+    # 过长文本降分（可能混入目录）
+    if len(t) > 600:
+        score -= 0.15
+
+    # 含"建议"或"对策"：适合作为结论性 finding
+    if re.search(r"(建议|对策|措施|举措)", t):
+        score += 0.08
+
+    # 来自多行合并（段落式文本）加分：说明有实质内容
+    lines = [l for l in t.split("\n") if l.strip()]
+    if len(lines) >= 2:
+        score += 0.05
+
+    return max(0.0, min(1.0, score))
+
+
 def _finding_points(section_text: str) -> List[str]:
-    paragraphs = [p.strip() for p in re.split(r"\n{2,}|[。！？]", str(section_text or "")) if len(p.strip()) >= 24]
+    raw = str(section_text or "").strip()
+    if not raw:
+        return []
+
+    # 第一步：优先按段落分割（段落间有大空白或句号）
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", raw) if p.strip()]
     if not paragraphs:
-        cleaned = re.sub(r"\s+", " ", str(section_text or "")).strip()
-        return [cleaned[:180]] if cleaned else []
-    scored = sorted(paragraphs, key=lambda x: len(x), reverse=True)
-    return [re.sub(r"\s+", " ", p).strip()[:200] for p in scored[:2]]
+        # 没有段落分隔符，按句子分割
+        paragraphs = [p.strip() for p in re.split(r"[。！？]", raw) if len(p.strip()) >= 20]
+
+    valid: List[str] = []
+    for p in paragraphs:
+        cleaned = re.sub(r"\s+", " ", p).strip()
+        if len(cleaned) < 20:
+            continue
+        if _is_junk_finding_text(cleaned):
+            continue
+        valid.append(cleaned)
+
+    if not valid:
+        # 兜底：整段文本中找有句号的完整句子
+        sentences = [s.strip() for s in re.split(r"[。！？]", raw) if len(s.strip()) >= 20]
+        meaningful = [s for s in sentences if not _is_junk_finding_text(s)]
+        if meaningful:
+            valid = meaningful
+        else:
+            cleaned = re.sub(r"\s+", " ", raw).strip()
+            return [cleaned[:180]] if cleaned else []
+
+    # 按质量评分排序，分数相同的按长度降序
+    scored = sorted(valid, key=lambda x: (_score_finding_quality(x), len(x)), reverse=True)
+    # 返回质量最好的2条，每条最多220字
+    return [p[:220] for p in scored[:2]]
 
 
 def ingest_report_directory_to_report_layer(

@@ -14,7 +14,7 @@ LOG = logging.getLogger(__name__)
 
 
 def _post_global_id(topic: str, channel: str, row_id: str) -> str:
-    """Duplicate of sync_mysql_to_neo4j._post_global_id to avoid circular import."""
+    """Duplicate of sync_to_neo4j._post_global_id to avoid circular import."""
     return f"{topic}_{channel}_{row_id}"
 
 

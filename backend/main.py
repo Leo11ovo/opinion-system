@@ -151,7 +151,7 @@ def graph_sync(topic, date):
     将已上传的专题数据同步到 Neo4j 图数据库
     """
     try:
-        from src.graph.sync_mysql_to_neo4j import sync_after_upload
+        from src.graph.sync_to_neo4j import sync_after_upload
         result = sync_after_upload(topic, date, logger=None)
         ok = result.get("status") == "ok"
         _log_project_event(topic, "graph_sync", {"date": date, "source": "cli", "result": result}, ok)
@@ -426,7 +426,7 @@ def data_pipeline(topic, date):
 
     # 5. Neo4j 图同步（Upload 成功后；未配置或失败仅打日志，不中断流水线）
     try:
-        from src.graph.sync_mysql_to_neo4j import sync_after_upload
+        from src.graph.sync_to_neo4j import sync_after_upload
         graph_result = sync_after_upload(topic, date, logger=None)
         _log_project_event(topic, "graph_sync", {"date": date, "source": "pipeline", "result": graph_result}, graph_result.get("status") == "ok")
         if graph_result.get("status") == "error":

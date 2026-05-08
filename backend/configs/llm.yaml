@@ -62,3 +62,4 @@ langchain:
 presets: []
 credentials:
   openai_base_url: https://api.siliconflow.cn/v1
+  qwen_api_key: sk-7b22413bfe8845b3bc59613d43903793

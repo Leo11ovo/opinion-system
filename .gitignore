@@ -1,7 +1,7 @@
 # Python
 backend/venv/
 backend/configs/*
-!backend/configs/llm.yaml
+backend/configs/bertopic.json
 !backend/configs/llm.local.example.yaml
 !backend/configs/chart_aliases.yaml
 !backend/configs/stopwords.txt
@@ -36,6 +36,8 @@ backend/store/*
 backend/logs/*
 !backend/store/.gitkeep
 backend/src/filter/cache/
+backend/.locks/ 
+backend/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/ 
 
 # LangGraph API
 backend/.langgraph_api/

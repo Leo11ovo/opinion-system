@@ -1,5 +1,5 @@
 """
-Neo4j 图模块：图结构定义、MySQL 同步、实体抽取与切块。
+Neo4j 图模块：图结构定义、统一入图、实体抽取与切块。
 """
 from .config import get_graph_config, is_neo4j_configured
 from .neo4j_client import get_driver, get_session, close_driver
@@ -10,7 +10,7 @@ from .report_layer import (
     ingest_report_directory_to_report_layer,
     clear_report_layer,
 )
-from .sync_mysql_to_neo4j import sync_after_upload
+from .sync_to_neo4j import sync_after_upload
 
 __all__ = [
     "get_graph_config",
