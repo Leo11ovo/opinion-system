@@ -36,6 +36,7 @@ backend/store/*
 backend/logs/*
 !backend/store/.gitkeep
 backend/src/filter/cache/
+bscm-history-item:f%3A%5Copinion-system%5Copinion-system?%7B%22repositoryId%22%3A%22scm0%22%2C%22historyItemId%22%3A%22a5ceea59ef08e5d1f3807dfbc5a540af30c3cef2%22%2C%22historyItemParentId%22%3A%227d2167499e2ecc71fb09fc759543f5a3949cab4c%22%2C%22historyItemDisplayId%22%3A%22a5ceea5%22%7D
 backend/.locks/ 
 backend/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/ 
 

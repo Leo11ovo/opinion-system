@@ -21,6 +21,7 @@ from server_support.topic_context import TopicContext  # type: ignore
 from src.project import get_project_manager  # type: ignore
 from src.report.deep_report import (  # type: ignore
     AI_FULL_REPORT_CACHE_FILENAME,
+    AI_FULL_REPORT_HTML_FILENAME,
     REPORT_CACHE_FILENAME,
     RUNTIME_CONTRACT_VERSION,
     ReportRuntimeFailure,
@@ -158,6 +159,7 @@ def _run_task(task_id: str) -> None:
     request = dict(task.get("request") or {})
     resume_context = request.get("resume_context") if isinstance(request.get("resume_context"), dict) else {}
     failure_resume_context = resume_context if str(resume_context.get("kind") or "").strip() == "resume_before_failure" else {}
+    is_checkpoint_resume = str(task.get("resume_kind") or resume_context.get("kind") or "").strip() == "checkpoint_resume"
     task_runtime_version = str(
         request.get("runtime_contract_version")
         or task.get("runtime_contract_version")
@@ -182,6 +184,7 @@ def _run_task(task_id: str) -> None:
     storage_topic = f"{project_identifier}-{topic_identifier}".strip("-") if project_identifier else topic_identifier
     cache_path = bucket("reports", storage_topic, folder) / REPORT_CACHE_FILENAME
     full_cache_path = bucket("reports", storage_topic, folder) / AI_FULL_REPORT_CACHE_FILENAME
+    full_html_path = bucket("reports", storage_topic, folder) / AI_FULL_REPORT_HTML_FILENAME
     LOGGER.warning(
         "report worker | task start | task=%s topic=%s start=%s end=%s mode=%s",
         task_id,
@@ -200,21 +203,22 @@ def _run_task(task_id: str) -> None:
     heartbeat.start()
     try:
         _raise_if_cancelled(task_id)
-        if failure_resume_context:
+        if failure_resume_context or is_checkpoint_resume:
+            resume_label = "checkpoint_resume" if is_checkpoint_resume and not failure_resume_context else "failure_before_compile"
             mark_task_progress(
                 task_id,
                 phase="planning",
                 percentage=PHASE_PERCENTAGE["compile"],
-                message="正在从失败前一步恢复，并重新进入正式编译链。",
+                message="正在从上次断点恢复，并重新进入报告运行链。",
             )
             append_event(
                 task_id,
                 event_type="phase.context",
                 phase="planning",
                 title="任务恢复中",
-                message="系统正在基于上一轮结构化结果，重新进入正式编译链。",
+                message="系统正在基于上次断点，恢复报告运行链。",
                 payload={
-                    "resume_from": "failure_before_compile",
+                    "resume_from": resume_label,
                     "source_task_id": str(failure_resume_context.get("source_task_id") or "").strip(),
                     "source_phase": str(failure_resume_context.get("source_failed_phase") or "").strip(),
                     "source_actor": str(failure_resume_context.get("source_failed_actor") or "").strip(),
@@ -303,7 +307,6 @@ def _run_task(task_id: str) -> None:
                 raise TaskCancelled("审批已拒绝，本次报告未继续写入正式结果。")
 
             resume_payload = _build_resume_payload_from_task(task)
-        is_checkpoint_resume = str(task.get("resume_kind") or "").strip() == "checkpoint_resume"
         if resume_payload is not None and task_runtime_version != RUNTIME_CONTRACT_VERSION:
             diagnostic = {
                 "category": "legacy_runtime_version",
@@ -323,7 +326,7 @@ def _run_task(task_id: str) -> None:
             )
             raise ReportRuntimeFailure("旧 ABI 任务不能直接 resume 到当前运行时。", diagnostic)
         if resume_payload is None:
-            mark_task_progress(task_id, phase="interpret", percentage=PHASE_PERCENTAGE["interpret"], message="总控代理正在调度子代理并生成结构化结果。")
+            mark_task_progress(task_id, phase="interpret", percentage=PHASE_PERCENTAGE["interpret"], message="总控代理正在调度子代理并整理报告底稿。")
         else:
             mark_task_progress(task_id, phase="persist", percentage=PHASE_PERCENTAGE["persist"], message="审批已处理，正在恢复正式写入流程。")
             try:
@@ -374,7 +377,7 @@ def _run_task(task_id: str) -> None:
                 )
             mark_artifact_ready(
                 task_id,
-                message="结构化结果已生成，正式文稿触发语义边界审查，等待人工确认。",
+                message="报告底稿已生成，正式文稿触发语义边界审查，等待人工确认。",
                 payload={
                     "report_cache_path": str(cache_path) if structured_payload else "",
                     "report_title": str(((structured_payload.get("task") or {}).get("topic_label")) or topic_label).strip() if structured_payload else "",
@@ -409,34 +412,39 @@ def _run_task(task_id: str) -> None:
                 task_id,
                 trust=_trust_from_payload(report_payload),
                 phase="structure",
-                message="已根据结构化结果更新置信信息。",
+                message="已根据报告底稿更新置信信息。",
             )
             _maybe_update_fallback_todos(
                 task_id,
                 stage="review",
                 phase="structure",
-                message="结构化结果已生成，正在进入正式编译。",
+                message="报告底稿已生成，正在进入正式编译。",
             )
         _raise_if_cancelled(task_id)
         if not report_payload:
-            raise RuntimeError("深度代理未产出结构化报告缓存。")
+            raise RuntimeError("深度代理未产出报告底稿缓存。")
         if not isinstance(full_report_payload, dict) or not str(full_report_payload.get("markdown") or "").strip():
             raise RuntimeError("正式 Markdown 报告生成失败。")
+        manifest = full_report_payload.get("artifact_manifest") if isinstance(full_report_payload.get("artifact_manifest"), dict) else {}
+        full_html_record = manifest.get("full_html") if isinstance(manifest.get("full_html"), dict) else {}
+        if full_html_record and (str(full_html_record.get("status") or "").strip() != "ready" or not full_html_path.exists()):
+            raise RuntimeError("HTML 报告生成失败。")
 
         mark_task_progress(task_id, phase="persist", percentage=PHASE_PERCENTAGE["persist"], message="正在整理最终报告产物。")
         _maybe_update_fallback_todos(
             task_id,
             stage="completed",
             phase="persist",
-            message="结构化结果、正式文稿和校验结果均已完成。",
+            message="报告底稿、正式文稿和校验结果均已完成。",
         )
         mark_artifact_ready(
             task_id,
-            message="结构化报告与 AI 完整报告缓存已写入。",
+            message="报告底稿、Markdown 文稿与 HTML 报告缓存已写入。",
             payload={
                 "report_cache_path": str(cache_path),
                 "report_title": str(((report_payload.get("task") or {}).get("topic_label")) or topic_label).strip(),
                 "full_report_cache_path": str(full_cache_path),
+                "full_html_cache_path": str(full_html_path),
                 "full_report_title": str(full_report_payload.get("title") or "").strip(),
                 "report_runtime_artifact": str(build_artifacts_root(task_id, get_data_root()) / "report.md"),
                 "artifact_manifest": (
@@ -458,6 +466,7 @@ def _run_task(task_id: str) -> None:
             "report_cache_path": str(cache_path),
             "report_title": str(((report_payload.get("task") or {}).get("topic_label")) or topic_label).strip(),
             "full_report_cache_path": str(full_cache_path),
+            "full_html_cache_path": str(full_html_path),
             "full_report_title": str(full_report_payload.get("title") or "").strip(),
             "artifact_manifest": (
                 full_report_payload.get("artifact_manifest")
@@ -668,9 +677,9 @@ def _failure_message(exc: Exception, diagnostic: Dict[str, Any]) -> str:
         return "模型连接失败：当前环境无法访问上游模型服务。"
     closure_stage = str(diagnostic.get("closure_stage") or "").strip()
     if closure_stage == "fallback_synthesis_failed":
-        return "总控未保存结构化结果，服务端补写失败。"
+        return "总控未保存报告底稿，服务端补写失败。"
     if closure_stage == "structured_validation_failed":
-        return "结构化结果已生成，但字段校验未通过。"
+        return "报告底稿已生成，但字段校验未通过。"
     if closure_stage == "agent_save_missing":
         return "总控未调用结构化保存，系统已尝试自动补写。"
     if closure_stage == "tool_round_limit_reached":
